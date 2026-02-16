@@ -9,7 +9,7 @@
  * @brief Network sharing server for ISO/IMG files.
  * 
  * Provides support for sharing ISO/IMG files over the network using
- * multiple protocols: SMB, NFS, and NBD (Network Block Device).
+ * multiple protocols: SMB, HTTP (iPXE), and iSCSI.
  */
 
 /**
@@ -18,9 +18,9 @@
  */
 enum class NetworkProtocol {
     NONE = 0,   ///< No protocol selected
-    SMB,        ///< SMB/CIFS (Windows file sharing)
-    NFS,        ///< NFS (Network File System)
-    NBD         ///< NBD (Network Block Device) - bootable
+    SMB,        ///< SMB/CIFS (Windows file sharing) - NOT bootable
+    HTTP,       ///< HTTP Server (iPXE) - BOOTABLE
+    ISCSI       ///< iSCSI (Network Block Device) - BOOTABLE
 };
 
 /**
@@ -29,11 +29,13 @@ enum class NetworkProtocol {
  */
 struct NetworkShareOptions {
     NetworkProtocol protocol;      ///< Protocol to use
-    std::string share_name;       ///< Share name (for SMB)
-    std::vector<std::string> paths; ///< Files to share
-    uint16_t port;                ///< Port to listen on (default: varies by protocol)
-    bool read_only;               ///< Read-only access
-    std::string ip_address;       ///< Specific IP to bind to (empty = all interfaces)
+    std::string share_name;        ///< Share name (for SMB)
+    std::string username;          ///< Username for SMB authentication
+    std::string password;          ///< Password for SMB authentication
+    std::vector<std::string> paths;///< Files to share
+    uint16_t port;                 ///< Port to listen on (default: varies by protocol)
+    bool read_only;                ///< Read-only access
+    std::string ip_address;        ///< Specific IP to bind to (empty = all interfaces)
 };
 
 /**
@@ -44,18 +46,18 @@ struct NetworkShareOptions {
 bool has_smb_server();
 
 /**
- * @brief Check if NFS server is available on the system.
+ * @brief Check if a simple HTTP server can be started (built-in).
  * 
- * @return true if NFS server is available, false otherwise.
+ * @return true always (built-in server), false on error.
  */
-bool has_nfs_server();
+bool has_http_server();
 
 /**
- * @brief Check if NBD server is available on the system.
+ * @brief Check if iSCSI target daemon is available on the system.
  * 
- * @return true if nbd-server is available, false otherwise.
+ * @return true if target daemon is available, false otherwise.
  */
-bool has_nbd_server();
+bool has_iscsi_target();
 
 /**
  * @brief Start network sharing with the specified options.
@@ -105,7 +107,7 @@ std::string get_local_ip_address();
  * @brief Convert NetworkProtocol enum to human-readable string.
  * 
  * @param protocol The NetworkProtocol value.
- * @return String representation (e.g., "SMB", "NFS", "NBD").
+ * @return String representation (e.g., "SMB", "HTTP", "iSCSI").
  */
 std::string network_protocol_to_string(NetworkProtocol protocol);
 

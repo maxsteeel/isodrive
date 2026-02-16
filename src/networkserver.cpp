@@ -9,6 +9,11 @@
 #include <atomic>
 #include <mutex>
 #include <csignal>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -17,6 +22,12 @@ static std::atomic<bool> g_network_share_running(false);
 static std::atomic<NetworkProtocol> g_current_protocol(NetworkProtocol::NONE);
 static NetworkShareOptions g_current_options;
 static std::mutex g_network_mutex;
+static std::thread g_http_server_thread;
+static int g_http_server_socket = -1;
+
+// Default credentials
+static const std::string DEFAULT_SMB_USER = "isodrive";
+static const std::string DEFAULT_SMB_PASS = "isodrive123";
 
 static bool execute_command(const std::string& cmd) {
   log_debug("Executing: " + cmd);
@@ -49,24 +60,24 @@ bool has_smb_server() {
          !execute_command_output("which nmbd").empty();
 }
 
-bool has_nfs_server() {
-  // Check for NFS server components
-  return fs::exists("/usr/sbin/rpc.nfsd") || 
-         fs::exists("/sbin/rpc.nfsd") ||
-         fs::exists("/usr/sbin/exportfs") ||
-         !execute_command_output("which rpc.nfsd").empty();
+bool has_http_server() {
+  // Built-in HTTP server always available
+  return true;
 }
 
-bool has_nbd_server() {
-  // Check for NBD server
-  return fs::exists("/usr/sbin/nbd-server") || 
-         fs::exists("/sbin/nbd-server") ||
-         !execute_command_output("which nbd-server").empty();
+bool has_iscsi_target() {
+  // Check for iSCSI target (tgtd or targetcli)
+  return fs::exists("/usr/sbin/tgtd") || 
+         fs::exists("/sbin/tgtd") ||
+         fs::exists("/usr/bin/targetcli") ||
+         fs::exists("/usr/sbin/targetctl") ||
+         !execute_command_output("which tgtd").empty() ||
+         !execute_command_output("which targetcli").empty();
 }
 
 std::string get_local_ip_address() {
   // Try to get IP from common interfaces
-  std::vector<std::string> interfaces = {"wlan0", "eth0", "usb0", "rndis0", "ap0"};
+  std::vector<std::string> interfaces = {"wlan0", "eth0", "usb0", "rndis0", "ap0", "en0"};
   
   for (const auto& iface : interfaces) {
     std::string cmd = "ip -4 addr show " + iface + " 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'";
@@ -99,21 +110,27 @@ std::string get_local_ip_address() {
 std::string network_protocol_to_string(NetworkProtocol protocol) {
   switch (protocol) {
     case NetworkProtocol::SMB: return "SMB";
-    case NetworkProtocol::NFS: return "NFS";
-    case NetworkProtocol::NBD: return "NBD";
+    case NetworkProtocol::HTTP: return "HTTP (iPXE)";
+    case NetworkProtocol::ISCSI: return "iSCSI";
     default: return "None";
   }
 }
 
-// SMB Server Implementation
+// SMB Server Implementation with user/pass
 static bool start_smb_server(const NetworkShareOptions& options) {
   log_info("Starting SMB server...");
   
   std::string share_name = options.share_name.empty() ? "isodrive" : options.share_name;
+  std::string username = options.username.empty() ? DEFAULT_SMB_USER : options.username;
+  std::string password = options.password.empty() ? DEFAULT_SMB_PASS : options.password;
   
   // Create SMB config directory
   std::string smb_conf_dir = "/data/local/tmp/isodrive_smb";
   fs::create_directories(smb_conf_dir);
+  
+  // Create user if needed (using system user)
+  execute_command("id " + username + " 2>/dev/null || useradd -M -s /bin/false " + username);
+  execute_command("(echo " + username + ":" + password + " | chpasswd) 2>/dev/null");
   
   // Create SMB configuration file
   std::string smb_conf = smb_conf_dir + "/smb.conf";
@@ -126,23 +143,29 @@ static bool start_smb_server(const NetworkShareOptions& options) {
   config << "[global]\n";
   config << "  workgroup = WORKGROUP\n";
   config << "  server string = ISOdrive Network Share\n";
-  config << "  security = user\n";
+  config << "  security = USER\n";
   config << "  map to guest = Bad User\n";
   config << "  min protocol = SMB2\n";
   config << "  max protocol = SMB3\n";
   config << "  force user = root\n";
   config << "  force group = root\n";
-  config << "  log level = 0\n\n";
+  config << "  log level = 0\n";
+  config << "  load printers = no\n";
+  config << "  printing = bsd\n";
+  config << "  disable spoolss = yes\n\n";
   
   config << "[" << share_name << "]\n";
   config << "  path = " << smb_conf_dir << "/content\n";
   config << "  comment = ISOdrive Network Share\n";
-  config << "  guest ok = yes\n";
+  config << "  valid users = " << username << "\n";
+  config << "  guest ok = no\n";
   config << "  read only = " << (options.read_only ? "yes" : "no") << "\n";
   config << "  browseable = yes\n";
   config << "  writable = " << (options.read_only ? "no" : "yes") << "\n";
   config << "  create mask = 0777\n";
   config << "  directory mask = 0777\n";
+  config << "  follow symlinks = yes\n";
+  config << "  wide links = yes\n";
   config.close();
   
   // Create content directory and symlinks to shared files
@@ -167,16 +190,20 @@ static bool start_smb_server(const NetworkShareOptions& options) {
     }
   }
   
-  // Start smbd if not running
-  if (!execute_command("pgrep -x smbd > /dev/null")) {
-    std::string cmd = "smbd --configfile=" + smb_conf + " --daemon";
-    if (!execute_command(cmd)) {
-      log_error("Failed to start smbd");
-      return false;
-    }
-    // Start nmbd as well for network browsing
-    execute_command("nmbd --configfile=" + smb_conf + " --daemon");
+  // Stop any existing smbd
+  execute_command("killall smbd 2>/dev/null");
+  execute_command("killall nmbd 2>/dev/null");
+  sleep(1);
+  
+  // Start smbd
+  std::string cmd = "smbd --configfile=" + smb_conf + " --daemon";
+  if (!execute_command(cmd)) {
+    log_error("Failed to start smbd");
+    return false;
   }
+  
+  // Start nmbd for network browsing
+  execute_command("nmbd --configfile=" + smb_conf + " --daemon");
   
   log_info("SMB server started successfully!");
   return true;
@@ -198,17 +225,160 @@ static bool stop_smb_server() {
   return true;
 }
 
-// NFS Server Implementation
-static bool start_nfs_server(const NetworkShareOptions& options) {
-  log_info("Starting NFS server...");
+// HTTP Server Implementation with iPXE support
+static bool handle_http_request(int client_fd, const std::string& path) {
+  std::string filename = fs::path(path).filename();
+  std::string file_path = "/data/local/tmp/isodrive_http/content/" + filename;
   
-  std::string nfs_export_dir = "/data/local/tmp/isodrive_nfs";
-  fs::create_directories(nfs_export_dir);
+  if (!fs::exists(file_path)) {
+    std::string not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+    send(client_fd, not_found.c_str(), not_found.length(), 0);
+    return false;
+  }
+  
+  // Get file size
+  uint64_t file_size = fs::file_size(file_path);
+  
+  // Send HTTP headers
+  std::ostringstream response;
+  response << "HTTP/1.1 200 OK\r\n";
+  response << "Content-Type: application/octet-stream\r\n";
+  response << "Content-Length: " << file_size << "\r\n";
+  response << "Content-Disposition: attachment; filename=\"" << filename << "\"\r\n";
+  response << "Accept-Ranges: bytes\r\n";
+  response << "Access-Control-Allow-Origin: *\r\n";
+  response << "\r\n";
+  
+  std::string headers = response.str();
+  send(client_fd, headers.c_str(), headers.length(), 0);
+  
+  // Send file content in chunks
+  std::ifstream file(file_path, std::ios::binary);
+  if (!file) {
+    return false;
+  }
+  
+  char buffer[8192];
+  while (file.good() && !file.eof()) {
+    file.read(buffer, sizeof(buffer));
+    ssize_t bytes_read = file.gcount();
+    if (bytes_read > 0) {
+      send(client_fd, buffer, bytes_read, 0);
+    }
+  }
+  
+  return true;
+}
+
+static void http_server_worker(int port) {
+  g_http_server_socket = socket(AF_INET, SOCK_STREAM, 0);
+  if (g_http_server_socket < 0) {
+    log_error("Failed to create HTTP server socket");
+    return;
+  }
+  
+  int opt = 1;
+  setsockopt(g_http_server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  
+  struct sockaddr_in server_addr;
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_addr.s_addr = INADDR_ANY;
+  server_addr.sin_port = htons(port);
+  
+  if (bind(g_http_server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+    log_error("Failed to bind HTTP server to port " + std::to_string(port));
+    close(g_http_server_socket);
+    g_http_server_socket = -1;
+    return;
+  }
+  
+  if (listen(g_http_server_socket, 5) < 0) {
+    log_error("Failed to listen on HTTP server");
+    close(g_http_server_socket);
+    g_http_server_socket = -1;
+    return;
+  }
+  
+  log_info("HTTP server listening on port " + std::to_string(port));
+  
+  while (g_network_share_running.load()) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    
+    int client_fd = accept(g_http_server_socket, (struct sockaddr*)&client_addr, &client_len);
+    if (client_fd < 0) {
+      if (g_network_share_running.load()) {
+        log_warn("Failed to accept HTTP connection");
+      }
+      continue;
+    }
+    
+    // Simple HTTP request parsing
+    char buffer[1024];
+    ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    if (bytes_read > 0) {
+      buffer[bytes_read] = '\0';
+      
+      // Parse request line
+      std::string request(buffer);
+      std::istringstream iss(request);
+      std::string method, path, http_version;
+      iss >> method >> path >> http_version;
+      
+      log_debug("HTTP request: " + method + " " + path);
+      
+      // Simple iPXE support - redirect to file download
+      if (path == "/" || path == "/boot.ipxe") {
+        // Generate iPXE script
+        std::ostringstream ipxe_script;
+        ipxe_script << "#!ipxe\n";
+        ipxe_script << "echo ISOdrive iPXE Boot Menu\n";
+        ipxe_script << "echo Loading boot files...\n";
+        
+        std::string ip = get_local_ip_address();
+        for (const auto& file : g_current_options.paths) {
+          std::string filename = fs::path(file).filename();
+          ipxe_script << "kernel http://" << ip << ":" << port << "/" << filename << "\n";
+          ipxe_script << "boot\n";
+        }
+        
+        std::string response = "HTTP/1.1 200 OK\r\n";
+        response += "Content-Type: text/plain\r\n";
+        response += "Content-Length: " + std::to_string(ipxe_script.str().length()) + "\r\n";
+        response += "X-Theme: ipxe\r\n";
+        response += "\r\n";
+        response += ipxe_script.str();
+        
+        send(client_fd, response.c_str(), response.length(), 0);
+      } else {
+        // Serve file
+        handle_http_request(client_fd, path);
+      }
+    }
+    
+    close(client_fd);
+  }
+  
+  if (g_http_server_socket >= 0) {
+    close(g_http_server_socket);
+    g_http_server_socket = -1;
+  }
+}
+
+static bool start_http_server(const NetworkShareOptions& options) {
+  log_info("Starting HTTP server (iPXE boot support)...");
+  
+  int port = options.port > 0 ? options.port : 8080;
+  
+  // Create HTTP content directory
+  std::string http_content_dir = "/data/local/tmp/isodrive_http/content";
+  fs::create_directories(http_content_dir);
   
   // Create symlinks to shared files
   for (const auto& path : options.paths) {
     std::string filename = fs::path(path).filename();
-    std::string link_path = nfs_export_dir + "/" + filename;
+    std::string link_path = http_content_dir + "/" + filename;
     
     if (fs::exists(link_path)) {
       fs::remove(link_path);
@@ -216,131 +386,139 @@ static bool start_nfs_server(const NetworkShareOptions& options) {
     
     try {
       fs::create_symlink(path, link_path);
-      log_info("Shared via NFS: " + filename);
+      log_info("Shared via HTTP: " + filename);
     } catch (const fs::filesystem_error& e) {
       log_warn("Failed to create symlink for " + path + ": " + e.what());
     }
   }
   
-  // Export the directory
-  std::string exports_file = "/data/local/tmp/isodrive_exports";
-  std::ofstream exp_file(exports_file);
-  if (exp_file) {
-    exp_file << nfs_export_dir << " *(rw,sync,no_subtree_check,no_root_squash)\n";
-    exp_file.close();
-  }
+  // Start HTTP server in background thread
+  g_http_server_thread = std::thread(http_server_worker, port);
   
-  // Start rpcbind if not running
-  execute_command("rpcbind 2>/dev/null");
+  // Wait a bit for server to start
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
   
-  // Start NFS server
-  std::string cmd = "rpc.nfsd 8 2>/dev/null";
-  if (!execute_command(cmd)) {
-    log_warn("Failed to start rpc.nfsd, trying alternative...");
-    // Try without specifying number of threads
-    cmd = "rpc.nfsd 2>/dev/null";
-    if (!execute_command(cmd)) {
-      log_error("Failed to start NFS server");
-      return false;
+  if (g_http_server_socket < 0) {
+    log_error("Failed to start HTTP server");
+    if (g_http_server_thread.joinable()) {
+      g_http_server_thread.detach();
     }
+    return false;
   }
   
-  cmd = "rpc.mountd 2>/dev/null";
-  execute_command(cmd);
-  
-  // Exportfs -r to apply exports
-  execute_command("exportfs -r 2>/dev/null");
-  
-  log_info("NFS server started successfully!");
+  log_info("HTTP server started successfully!");
   return true;
 }
 
-static bool stop_nfs_server() {
-  log_info("Stopping NFS server...");
+static bool stop_http_server() {
+  log_info("Stopping HTTP server...");
   
-  // Unexport and kill mountd
-  execute_command("exportfs -u 2>/dev/null");
-  execute_command("killall rpc.mountd 2>/dev/null");
-  execute_command("killall rpc.nfsd 2>/dev/null");
-  execute_command("killall rpcbind 2>/dev/null");
+  g_network_share_running.store(false);
+  
+  // Close socket to unblock accept
+  if (g_http_server_socket >= 0) {
+    close(g_http_server_socket);
+    g_http_server_socket = -1;
+  }
+  
+  // Wait for thread to finish
+  if (g_http_server_thread.joinable()) {
+    g_http_server_thread.join();
+  }
   
   // Clean up
-  std::string nfs_export_dir = "/data/local/tmp/isodrive_nfs";
-  if (fs::exists(nfs_export_dir)) {
-    fs::remove_all(nfs_export_dir);
+  std::string http_content_dir = "/data/local/tmp/isodrive_http";
+  if (fs::exists(http_content_dir)) {
+    fs::remove_all(http_content_dir);
   }
   
   return true;
 }
 
-// NBD Server Implementation (bootable block device over network)
-static bool start_nbd_server(const NetworkShareOptions& options) {
-  log_info("Starting NBD (Network Block Device) server...");
+// iSCSI Target Implementation
+static bool start_iscsi_server(const NetworkShareOptions& options) {
+  log_info("Starting iSCSI target server...");
   
   if (options.paths.empty()) {
-    log_error("NBD requires at least one file to share");
+    log_error("iSCSI requires at least one file to share");
     return false;
   }
   
-  // For NBD, we'll share the first file as a block device
-  std::string nbd_config = "/data/local/tmp/isodrive_nbd";
-  fs::create_directories(nbd_config);
+  // For iSCSI, we'll use the first file as the LUN
+  std::string iscsi_file = options.paths[0];
+  std::string filename = fs::path(iscsi_file).filename();
   
-  // Create NBD config file
-  std::string nbd_conf_file = nbd_config + "/nbd.conf";
-  std::ofstream nbd_conf(nbd_conf_file);
-  if (!nbd_conf) {
-    log_error("Failed to create NBD config file");
-    return false;
-  }
+  // Check for targetcli (modern way)
+  bool has_targetcli = fs::exists("/usr/bin/targetcli") || fs::exists("/usr/sbin/targetcli");
   
-  // NBD configuration for the first file
-  std::string nbd_file = options.paths[0];
-  std::string filename = fs::path(nbd_file).filename();
-  
-  nbd_conf << "[generic]\n";
-  nbd_conf << "  oldstyle = true\n\n";
-  nbd_conf << "[" << filename << "]\n";
-  nbd_conf << "  exportfile = " << nbd_file << "\n";
-  nbd_conf << "  read_only = " << (options.read_only ? "true" : "false") << "\n";
-  nbd_conf << "  multifile = false\n";
-  nbd_conf.close();
-  
-  // Kill existing nbd-server
-  execute_command("killall nbd-server 2>/dev/null");
-  
-  // Determine port (default for NBD is 10809)
-  int port = options.port > 0 ? options.port : 10809;
-  
-  // Start nbd-server
-  std::string cmd = "nbd-server -C " + nbd_conf_file + " -p " + std::to_string(port) + " " + nbd_file;
-  if (!execute_command(cmd)) {
-    log_error("Failed to start nbd-server");
-    log_info("Trying alternative method...");
+  if (has_targetcli) {
+    // Use targetcli to create iSCSI target
+    std::string target_iqn = "iqn.2024-02.isodrive:share1";
     
-    // Try alternative: nbd-server <port> <file>
-    cmd = "nbd-server " + std::to_string(port) + " " + nbd_file;
-    if (!execute_command(cmd)) {
-      log_error("Failed to start NBD server with alternative method");
-      return false;
+    // Create backstore
+    execute_command("targetcli /backstores/fileio create name=" + filename + " file=" + iscsi_file);
+    
+    // Create target
+    execute_command("targetcli /iscsi create " + target_iqn);
+    
+    // Create LUN
+    execute_command("targetcli /iscsi/" + target_iqn + "/tpg1/luns create /backstores/fileio/" + filename);
+    
+    // Set authentication (if needed)
+    execute_command("targetcli /iscsi/" + target_iqn + "/tpg1 set attribute authentication=0");
+    
+    // Enable target
+    execute_command("targetcli /iscsi/" + target_iqn + "/tpg1 set attribute generate_node_acls=1");
+    
+    log_info("iSCSI target created: " + target_iqn);
+    log_info("Connect from other device using:");
+    log_info("  iscsiadm --mode discovery --type sendtargets --portal " + get_local_ip_address());
+  } else {
+    // Try legacy tgtd approach
+    std::string iscsi_conf_dir = "/data/local/tmp/isodrive_iscsi";
+    fs::create_directories(iscsi_conf_dir);
+    
+    // Create ietd.conf style config
+    std::string iscsi_conf = iscsi_conf_dir + "/ietd.conf";
+    std::ofstream config(iscsi_conf);
+    if (config) {
+      config << "Target iqn.2024-02.isodrive:share1\n";
+      config << "  Lun 0 Path=" << iscsi_file << ",Type=fileio\n";
+      config << "  MaxConnections 5\n";
+      config.close();
     }
+    
+    // Start tgtd
+    execute_command("tgtd --config=" + iscsi_conf + " -f");
+    sleep(1);
+    
+    // Setup target
+    execute_command("ietadm --op new --tid=1 --targetname=iqn.2024-02.isodrive:share1");
+    execute_command("ietadm --op new --tid=1 --lun=0 --params Path=" + iscsi_file);
+    
+    log_info("iSCSI target started (legacy mode)");
   }
   
-  log_info("NBD server started successfully!");
-  log_info("Connect with: nbd-client <IP> " + std::to_string(port) + " /dev/nbd0");
+  log_info("iSCSI server started successfully!");
   return true;
 }
 
-static bool stop_nbd_server() {
-  log_info("Stopping NBD server...");
+static bool stop_iscsi_server() {
+  log_info("Stopping iSCSI server...");
   
-  // Kill nbd-server
-  execute_command("killall nbd-server 2>/dev/null");
+  // Try targetctl first
+  if (execute_command("targetctl clear")) {
+    // targetctl worked
+  }
+  
+  // Kill processes
+  execute_command("killall tgtd 2>/dev/null");
+  execute_command("killall targetd 2>/dev/null");
   
   // Clean up
-  std::string nbd_config = "/data/local/tmp/isodrive_nbd";
-  if (fs::exists(nbd_config)) {
-    fs::remove_all(nbd_config);
+  std::string iscsi_conf_dir = "/data/local/tmp/isodrive_iscsi";
+  if (fs::exists(iscsi_conf_dir)) {
+    fs::remove_all(iscsi_conf_dir);
   }
   
   return true;
@@ -367,42 +545,49 @@ bool start_network_share(const NetworkShareOptions& options) {
     }
   }
   
+  g_network_share_running.store(true);
+  
   bool success = false;
   
   switch (options.protocol) {
     case NetworkProtocol::SMB:
       if (!has_smb_server()) {
         log_error("SMB server (smbd) not available on this system");
+        g_network_share_running.store(false);
         return false;
       }
       success = start_smb_server(options);
       break;
       
-    case NetworkProtocol::NFS:
-      if (!has_nfs_server()) {
-        log_error("NFS server not available on this system");
+    case NetworkProtocol::HTTP:
+      if (!has_http_server()) {
+        log_error("HTTP server not available");
+        g_network_share_running.store(false);
         return false;
       }
-      success = start_nfs_server(options);
+      success = start_http_server(options);
       break;
       
-    case NetworkProtocol::NBD:
-      if (!has_nbd_server()) {
-        log_error("NBD server (nbd-server) not available on this system");
+    case NetworkProtocol::ISCSI:
+      if (!has_iscsi_target()) {
+        log_error("iSCSI target (targetcli/tgtd) not available on this system");
+        g_network_share_running.store(false);
         return false;
       }
-      success = start_nbd_server(options);
+      success = start_iscsi_server(options);
       break;
       
     default:
       log_error("Invalid or no network protocol specified");
+      g_network_share_running.store(false);
       return false;
   }
   
   if (success) {
-    g_network_share_running.store(true);
     g_current_protocol.store(options.protocol);
     g_current_options = options;
+  } else {
+    g_network_share_running.store(false);
   }
   
   return success;
@@ -423,11 +608,11 @@ bool stop_network_share() {
     case NetworkProtocol::SMB:
       success = stop_smb_server();
       break;
-    case NetworkProtocol::NFS:
-      success = stop_nfs_server();
+    case NetworkProtocol::HTTP:
+      success = stop_http_server();
       break;
-    case NetworkProtocol::NBD:
-      success = stop_nbd_server();
+    case NetworkProtocol::ISCSI:
+      success = stop_iscsi_server();
       break;
     default:
       success = false;
@@ -458,35 +643,46 @@ std::string get_network_share_status() {
     status << "IP Address: " << ip << "\n";
     
     switch (protocol) {
-      case NetworkProtocol::SMB:
-        status << "SMB URL: smb://" << ip << "/";
-        if (!g_current_options.share_name.empty()) {
-          status << g_current_options.share_name;
-        } else {
-          status << "isodrive";
+      case NetworkProtocol::SMB: {
+        std::string username = g_current_options.username.empty() ? DEFAULT_SMB_USER : g_current_options.username;
+        std::string password = g_current_options.password.empty() ? DEFAULT_SMB_PASS : g_current_options.password;
+        std::string share_name = g_current_options.share_name.empty() ? "isodrive" : g_current_options.share_name;
+        
+        status << "SMB URL: smb://" << ip << "/" << share_name << "\n";
+        status << "Windows: \\\\" << ip << "\\" << share_name << "\n";
+        status << "Username: " << username << "\n";
+        status << "Password: " << password << "\n";
+        break;
+      }
+        
+      case NetworkProtocol::HTTP: {
+        int port = g_current_options.port > 0 ? g_current_options.port : 8080;
+        status << "HTTP Port: " << port << "\n";
+        status << "iPXE Script: http://" << ip << ":" << port << "/boot.ipxe\n";
+        status << "\n";
+        status << "Download URLs:\n";
+        for (const auto& path : g_current_options.paths) {
+          std::string filename = fs::path(path).filename();
+          status << "  http://" << ip << ":" << port << "/" << filename << "\n";
         }
         status << "\n";
-        status << "Windows: \\\\"
-               << ip << "\\";
-        if (!g_current_options.share_name.empty()) {
-          status << g_current_options.share_name;
-        } else {
-          status << "isodrive";
-        }
+        status << "iPXE Boot Commands:\n";
+        status << "  chainloader http://" << ip << ":" << port << "/boot.ipxe\n";
+        break;
+      }
+        
+      case NetworkProtocol::ISCSI: {
+        status << "iSCSI Target: iqn.2024-02.isodrive:share1\n";
+        status << "Portal: " << ip << ":3260\n";
         status << "\n";
+        status << "Connect on Linux:\n";
+        status << "  iscsiadm --mode discovery --type sendtargets --portal " << ip << "\n";
+        status << "  iscsiadm --mode node --targetname iqn.2024-02.isodrive:share1 --portal " << ip << " --login\n";
+        status << "\n";
+        status << "Connect on Windows:\n";
+        status << "  Use iSCSI Initiator, add target: " << ip << "\n";
         break;
-        
-      case NetworkProtocol::NFS:
-        status << "NFS URL: " << ip << ":/data/local/tmp/isodrive_nfs\n";
-        status << "Mount: mount -t nfs " << ip << ":/data/local/tmp/isodrive_nfs /mnt\n";
-        break;
-        
-      case NetworkProtocol::NBD:
-        status << "NBD Port: " << (g_current_options.port > 0 ? g_current_options.port : 10809) << "\n";
-        status << "Connect: nbd-client " << ip << " " 
-               << (g_current_options.port > 0 ? std::to_string(g_current_options.port) : "10809")
-               << " /dev/nbd0\n";
-        break;
+      }
         
       default:
         break;
@@ -500,4 +696,3 @@ std::string get_network_share_status() {
   
   return status.str();
 }
-

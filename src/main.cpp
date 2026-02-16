@@ -50,15 +50,18 @@ void print_help() {
             << "-v, -verbose\t Enables verbose/debug output.\n"
             << "-q, -quiet\t Suppresses all output except errors.\n\n"
             << "Network sharing options:\n"
-            << "-net\t\t Enable network sharing (requires protocol: smb, nfs, nbd).\n"
+            << "-net\t\t Enable network sharing (requires protocol: smb, http, iscsi).\n"
             << "\t\t Usage: -net [protocol] [FILE]...\n"
-            << "\t\t Example: -net smb test.img\n"
-            << "\t\t Example: -net nfs test.iso test2.img\n"
-            << "\t\t Example: -net nbd boot.img\n\n"
+            << "\t\t Example: -net smb test.img -user admin -pass 123456\n"
+            << "\t\t Example: -net http boot.img\n"
+            << "\t\t Example: -net iscsi boot.img\n\n"
             << "Network protocols:\n"
             << "  smb\t\t SMB/CIFS (Windows file sharing) - NOT bootable\n"
-            << "  nfs\t\t NFS (Linux file sharing) - NOT bootable\n"
-            << "  nbd\t\t NBD (Network Block Device) - BOOTABLE\n\n"
+            << "  http\t\t HTTP Server (iPXE boot) - BOOTABLE\n"
+            << "  iscsi\t\t iSCSI (Network Block Device) - BOOTABLE\n\n"
+            << "Network SMB options:\n"
+            << "  -user\t\t Username for SMB (default: isodrive)\n"
+            << "  -pass\t\t Password for SMB (default: isodrive123)\n\n"
             << "Network management:\n"
             << "-net-status\t Show current network share status.\n"
             << "-net-stop\t Stop the current network share.\n\n";
@@ -161,6 +164,11 @@ int main(int argc, char *argv[]) {
   std::string create_format;
   std::string create_label;
   
+  // Network options
+  std::string net_user;
+  std::string net_pass;
+  uint16_t net_port = 0;
+  
   std::vector<std::string> iso_targets;
   std::vector<bool> cdroms;
   std::vector<bool> ros;
@@ -241,19 +249,31 @@ int main(int argc, char *argv[]) {
         std::string proto = argv[++i];
         if (proto == "smb") {
           net_protocol = NetworkProtocol::SMB;
-        } else if (proto == "nfs") {
-          net_protocol = NetworkProtocol::NFS;
-        } else if (proto == "nbd") {
-          net_protocol = NetworkProtocol::NBD;
+        } else if (proto == "http") {
+          net_protocol = NetworkProtocol::HTTP;
+        } else if (proto == "iscsi") {
+          net_protocol = NetworkProtocol::ISCSI;
         } else {
           log_error("Invalid network protocol: " + proto);
-          log_info("Valid protocols: smb, nfs, nbd");
+          log_info("Valid protocols: smb, http, iscsi");
           return 1;
         }
       } else {
         log_error("Missing network protocol after -net");
-        log_info("Usage: -net [smb|nfs|nbd] [file]...");
+        log_info("Usage: -net [smb|http|iscsi] [file]...");
         return 1;
+      }
+    } else if (arg == "-user") {
+      if (i + 1 < argc) {
+        net_user = argv[++i];
+      }
+    } else if (arg == "-pass") {
+      if (i + 1 < argc) {
+        net_pass = argv[++i];
+      }
+    } else if (arg == "-port") {
+      if (i + 1 < argc) {
+        net_port = std::stoi(argv[++i]);
       }
     } else if (arg == "-net-stop") {
       net_stop = true;
@@ -328,7 +348,7 @@ int main(int argc, char *argv[]) {
   if (net_mode) {
     if (net_protocol == NetworkProtocol::NONE) {
       log_error("No network protocol specified");
-      log_info("Usage: -net [smb|nfs|nbd] [file]...");
+      log_info("Usage: -net [smb|http|iscsi] [file]...");
       return 1;
     }
     
@@ -338,13 +358,13 @@ int main(int argc, char *argv[]) {
     }
     
     // Resolve all paths
-    for (size_t i = 0; i < iso_targets.size(); i++) {
-      std::string resolved = resolve_path(iso_targets[i]);
+    for (size_t j = 0; j < iso_targets.size(); j++) {
+      std::string resolved = resolve_path(iso_targets[j]);
       if (resolved.empty()) {
-        log_error("File not found: " + iso_targets[i]);
+        log_error("File not found: " + iso_targets[j]);
         return 1;
       }
-      iso_targets[i] = resolved;
+      iso_targets[j] = resolved;
     }
     
     // Create network share options
@@ -352,6 +372,9 @@ int main(int argc, char *argv[]) {
     net_opts.protocol = net_protocol;
     net_opts.paths = iso_targets;
     net_opts.read_only = true;
+    net_opts.username = net_user;
+    net_opts.password = net_pass;
+    net_opts.port = net_port;
     
     if (start_network_share(net_opts)) {
       std::cout << "\n=== Network Share Started ===\n";
@@ -395,15 +418,15 @@ int main(int argc, char *argv[]) {
       log_info("No files specified, unmounting all ISOs...");
     } else {
       // Resolve all paths with CWD support
-      for (size_t i = 0; i < iso_targets.size(); i++) {
-        std::string resolved = resolve_path(iso_targets[i]);
+      for (size_t j = 0; j < iso_targets.size(); j++) {
+        std::string resolved = resolve_path(iso_targets[j]);
         if (resolved.empty()) {
-          log_error("File not found: " + iso_targets[i]);
-          log_info("Resolved path was: " + iso_targets[i]);
+          log_error("File not found: " + iso_targets[j]);
+          log_info("Resolved path was: " + iso_targets[j]);
           return 1;
         }
-        log_info("Resolved: " + iso_targets[i] + " -> " + resolved);
-        iso_targets[i] = resolved;
+        log_info("Resolved: " + iso_targets[j] + " -> " + resolved);
+        iso_targets[j] = resolved;
       }
     }
 
@@ -417,8 +440,8 @@ int main(int argc, char *argv[]) {
     if (!iso_targets.empty() && !force_hdds.empty() && force_hdds[0]) {
       log_info("HDD mode forced, skipping Windows detection");
     } else if (!iso_targets.empty()) {
-      for (size_t i = 0; i < iso_targets.size(); i++) {
-        WindowsIsoInfo iso_info = get_windows_iso_info(iso_targets[i]);
+      for (size_t j = 0; j < iso_targets.size(); j++) {
+        WindowsIsoInfo iso_info = get_windows_iso_info(iso_targets[j]);
         
         if (iso_info.is_windows || windows_mode) {
           if (!win_opts.enabled) {
@@ -439,25 +462,25 @@ int main(int argc, char *argv[]) {
           win_opts.has_legacy = win_opts.has_legacy || iso_info.has_legacy;
           
           if (iso_info.is_windows && !windows_mode) {
-            log_info("Windows ISO detected: " + iso_targets[i]);
+            log_info("Windows ISO detected: " + iso_targets[j]);
             log_info("Auto-enabling Windows mode.");
           }
-        } else if (!force_hdds.empty() && !force_hdds[i]) {
-          if (!is_hybrid_iso(iso_targets[i])) {
-            if (i >= cdroms.size()) {
+        } else if (!force_hdds.empty() && !force_hdds[j]) {
+          if (!is_hybrid_iso(iso_targets[j])) {
+            if (j >= cdroms.size()) {
               cdroms.push_back(true);
             } else {
-              cdroms[i] = true;
+              cdroms[j] = true;
             }
-            log_info("Non-hybrid ISO detected: " + iso_targets[i] + ", using CD-ROM mode");
+            log_info("Non-hybrid ISO detected: " + iso_targets[j] + ", using CD-ROM mode");
           }
-        } else if (!is_hybrid_iso(iso_targets[i])) {
-          if (i >= cdroms.size()) {
+        } else if (!is_hybrid_iso(iso_targets[j])) {
+          if (j >= cdroms.size()) {
             cdroms.push_back(true);
           } else {
-            cdroms[i] = true;
+            cdroms[j] = true;
           }
-          log_info("Non-hybrid ISO detected: " + iso_targets[i] + ", using CD-ROM mode");
+          log_info("Non-hybrid ISO detected: " + iso_targets[j] + ", using CD-ROM mode");
         }
       }
     }
@@ -576,3 +599,4 @@ int main(int argc, char *argv[]) {
 
   return success ? 0 : 1;
 }
+
