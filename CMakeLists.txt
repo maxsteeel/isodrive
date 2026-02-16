@@ -15,6 +15,7 @@ set(LIB_SOURCES
     src/logger.cpp
     src/configfsisomanager.cpp
     src/androidusbisomanager.cpp
+    src/networkserver.cpp
 )
 
 add_library(isodrive_lib STATIC ${LIB_SOURCES})

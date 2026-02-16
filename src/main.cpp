@@ -1,6 +1,7 @@
 #include "androidusbisomanager.h"
 #include "configfsisomanager.h"
 #include "logger.h"
+#include "networkserver.h"
 #include "util.h"
 #include <iostream>
 #include <string>
@@ -47,7 +48,20 @@ void print_help() {
             << "-usbgadget\t Forces the app to use sysfs.\n\n"
             << "Output options:\n"
             << "-v, -verbose\t Enables verbose/debug output.\n"
-            << "-q, -quiet\t Suppresses all output except errors.\n\n";
+            << "-q, -quiet\t Suppresses all output except errors.\n\n"
+            << "Network sharing options:\n"
+            << "-net\t\t Enable network sharing (requires protocol: smb, nfs, nbd).\n"
+            << "\t\t Usage: -net [protocol] [FILE]...\n"
+            << "\t\t Example: -net smb test.img\n"
+            << "\t\t Example: -net nfs test.iso test2.img\n"
+            << "\t\t Example: -net nbd boot.img\n\n"
+            << "Network protocols:\n"
+            << "  smb\t\t SMB/CIFS (Windows file sharing) - NOT bootable\n"
+            << "  nfs\t\t NFS (Linux file sharing) - NOT bootable\n"
+            << "  nbd\t\t NBD (Network Block Device) - BOOTABLE\n\n"
+            << "Network management:\n"
+            << "-net-status\t Show current network share status.\n"
+            << "-net-stop\t Stop the current network share.\n\n";
 }
 
 bool configs(const std::string& iso_target, bool cdrom, bool ro, const WindowsMountOptions& win_opts) {
@@ -136,6 +150,10 @@ int main(int argc, char *argv[]) {
 
   bool multi_mode = false;
   bool create_mode = false;
+  bool net_mode = false;
+  bool net_stop = false;
+  bool net_status = false;
+  NetworkProtocol net_protocol = NetworkProtocol::NONE;
   std::string create_path;
   std::string create_size;
   bool create_dynamic = false;
@@ -216,6 +234,31 @@ int main(int argc, char *argv[]) {
       if (i + 1 < argc) {
         create_label = argv[++i];
       }
+    } else if (arg == "-net") {
+      net_mode = true;
+      // Next argument should be the protocol
+      if (i + 1 < argc) {
+        std::string proto = argv[++i];
+        if (proto == "smb") {
+          net_protocol = NetworkProtocol::SMB;
+        } else if (proto == "nfs") {
+          net_protocol = NetworkProtocol::NFS;
+        } else if (proto == "nbd") {
+          net_protocol = NetworkProtocol::NBD;
+        } else {
+          log_error("Invalid network protocol: " + proto);
+          log_info("Valid protocols: smb, nfs, nbd");
+          return 1;
+        }
+      } else {
+        log_error("Missing network protocol after -net");
+        log_info("Usage: -net [smb|nfs|nbd] [file]...");
+        return 1;
+      }
+    } else if (arg == "-net-stop") {
+      net_stop = true;
+    } else if (arg == "-net-status") {
+      net_status = true;
     } else if (arg == "-configfs") {
       force_configfs = true;
     } else if (arg == "-usbgadget") {
@@ -250,6 +293,75 @@ int main(int argc, char *argv[]) {
 
   if (argc == 1) {
     print_help();
+  }
+
+  // Handle network share stop
+  if (net_stop) {
+    if (stop_network_share()) {
+      log_info("Network share stopped successfully");
+      return 0;
+    } else {
+      log_error("Failed to stop network share");
+      return 1;
+    }
+  }
+
+  // Handle network share status
+  if (net_status) {
+    if (is_network_share_active()) {
+      std::string status = get_network_share_status();
+      if (!status.empty()) {
+        std::cout << "\n=== Network Share Status ===\n";
+        std::cout << status;
+        std::cout << "============================\n";
+      } else {
+        log_info("Network share is active but no status available");
+      }
+      return 0;
+    } else {
+      log_info("No network share is currently active");
+      return 0;
+    }
+  }
+
+  // Handle network sharing mode
+  if (net_mode) {
+    if (net_protocol == NetworkProtocol::NONE) {
+      log_error("No network protocol specified");
+      log_info("Usage: -net [smb|nfs|nbd] [file]...");
+      return 1;
+    }
+    
+    if (iso_targets.empty()) {
+      log_error("No files specified for network sharing");
+      return 1;
+    }
+    
+    // Resolve all paths
+    for (size_t i = 0; i < iso_targets.size(); i++) {
+      std::string resolved = resolve_path(iso_targets[i]);
+      if (resolved.empty()) {
+        log_error("File not found: " + iso_targets[i]);
+        return 1;
+      }
+      iso_targets[i] = resolved;
+    }
+    
+    // Create network share options
+    NetworkShareOptions net_opts;
+    net_opts.protocol = net_protocol;
+    net_opts.paths = iso_targets;
+    net_opts.read_only = true;
+    
+    if (start_network_share(net_opts)) {
+      std::cout << "\n=== Network Share Started ===\n";
+      std::cout << get_network_share_status();
+      std::cout << "=============================\n";
+      return 0;
+    } else {
+      log_error("Failed to start network share");
+      return 1;
+    }
   }
 
   if (create_mode) {
