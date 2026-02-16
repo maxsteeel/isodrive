@@ -330,6 +330,185 @@ bool mount_iso(const std::string& iso_path, bool cdrom, bool ro, const WindowsMo
   return success;
 }
 
+// New implementation for mounting multiple ISOs/IMGs as separate LUNs
+bool mount_multiple_isos(const std::vector<std::string>& iso_paths, 
+                         const std::vector<bool>& cdroms, 
+                         const std::vector<bool>& ros, 
+                         const WindowsMountOptions& win_opts) {
+  std::string gadgetRoot = get_gadget_root();
+
+  if (gadgetRoot.empty()) {
+    log_error("No active gadget found!");
+    return false;
+  }
+  std::string configRoot = get_config_root();
+  std::string udc = get_udc();
+
+  if (udc.empty()) {
+    log_error("Failed to get UDC!");
+    return false;
+  }
+
+  fs::path functionRoot = fs::path(gadgetRoot) / "functions";
+  fs::path massStorageRoot = functionRoot / "mass_storage.0";
+
+  bool success = true;
+
+  // Disable UDC before making changes
+  if (!set_udc("", gadgetRoot)) {
+    log_warn("Failed to disable UDC before configuration");
+  }
+
+  // If Windows mode is enabled, configure USB descriptors
+  if (win_opts.enabled) {
+    print_windows_info(win_opts);
+    
+    if (!configure_windows_descriptors(gadgetRoot, win_opts)) {
+      log_warn("Windows descriptor configuration had errors");
+    }
+  }
+
+  if (!fs::exists(massStorageRoot)) {
+    std::error_code ec;
+    fs::create_directories(massStorageRoot, ec);
+    if (ec) {
+      log_error("Failed to create mass_storage function: " + ec.message());
+      set_udc(udc, gadgetRoot);
+      return false;
+    }
+  }
+
+  fs::path stallFile = massStorageRoot / "stall";
+  // Disable stall for better Windows compatibility
+  success &= sysfs_write(stallFile.string(), "0");
+
+  // Remove existing symlinks first
+  fs::path linkPath = fs::path(configRoot) / "mass_storage.0";
+  if (fs::exists(linkPath)) {
+    std::error_code ec;
+    fs::remove(linkPath, ec);
+    if (ec) {
+      log_warn("Failed to remove existing symlink: " + ec.message());
+    }
+  }
+
+  // Create symlinks for each LUN
+  for (size_t i = 0; i < iso_paths.size(); ++i) {
+    if (!iso_paths[i].empty()) {
+      // Create LUN directory if it doesn't exist
+      fs::path lunRoot = massStorageRoot / ("lun." + std::to_string(i));
+      if (!fs::exists(lunRoot)) {
+        std::error_code ec;
+        fs::create_directories(lunRoot, ec);
+        if (ec) {
+          log_error("Failed to create LUN directory: " + ec.message());
+          continue;
+        }
+      }
+
+      fs::path lunFile = lunRoot / "file";
+      fs::path lunCdRom = lunRoot / "cdrom";
+      fs::path lunRo = lunRoot / "ro";
+
+      // Write file path to LUN
+      success &= sysfs_write(lunFile.string(), iso_paths[i]);
+      
+      // Set CD-ROM and read-only modes
+      if (i < cdroms.size()) {
+        success &= sysfs_write(lunCdRom.string(), cdroms[i] ? "1" : "0");
+      } else {
+        success &= sysfs_write(lunCdRom.string(), "0"); // Default to non-CD-ROM
+      }
+      
+      if (i < ros.size()) {
+        success &= sysfs_write(lunRo.string(), ros[i] ? "1" : "0");
+      } else {
+        success &= sysfs_write(lunRo.string(), "1"); // Default to read-only
+      }
+    }
+  }
+
+  // Create symlink to connect mass storage to config
+  fs::path massStorageLink = fs::path(configRoot) / "mass_storage.0";
+  if (!fs::exists(massStorageLink)) {
+    std::error_code ec;
+    fs::create_directory_symlink(massStorageRoot, massStorageLink, ec);
+    if (ec) {
+      log_error("Failed to create mass_storage symlink: " + ec.message());
+      set_udc(udc, gadgetRoot);
+      return false;
+    }
+  }
+
+  if (!set_udc(udc, gadgetRoot)) {
+    log_error("Failed to re-enable UDC");
+    return false;
+  }
+
+  log_info("Multiple ISOs/IMGs mounted as separate LUNs successfully!");
+  return success;
+}
+
+// New implementation for unmounting all ISOs/IMGs
+bool unmount_all_isos() {
+  std::string gadgetRoot = get_gadget_root();
+
+  if (gadgetRoot.empty()) {
+    log_error("No active gadget found!");
+    return false;
+  }
+  std::string configRoot = get_config_root();
+  std::string udc = get_udc();
+
+  if (udc.empty()) {
+    log_error("Failed to get UDC!");
+    return false;
+  }
+
+  fs::path functionRoot = fs::path(gadgetRoot) / "functions";
+  fs::path massStorageRoot = functionRoot / "mass_storage.0";
+
+  bool success = true;
+
+  // Disable UDC before making changes
+  if (!set_udc("", gadgetRoot)) {
+    log_warn("Failed to disable UDC before configuration");
+  }
+
+  // Clear all LUN file paths
+  int lunIndex = 0;
+  while (true) {
+    fs::path lunRoot = massStorageRoot / ("lun." + std::to_string(lunIndex));
+    if (fs::exists(lunRoot)) {
+      fs::path lunFile = lunRoot / "file";
+      success &= sysfs_write(lunFile.string(), "");
+      ++lunIndex;
+    } else {
+      // Stop if we encounter a missing LUN directory
+      // Since LUNs should be sequential (lun.0, lun.1, etc.)
+      break;
+    }
+  }
+
+  // Remove mass storage symlink
+  fs::path massStorageLink = fs::path(configRoot) / "mass_storage.0";
+  if (fs::exists(massStorageLink)) {
+    std::error_code ec;
+    fs::remove(massStorageLink, ec);
+    if (ec) {
+      log_warn("Failed to remove mass_storage symlink: " + ec.message());
+    }
+  }
+
+  if (!set_udc(udc, gadgetRoot)) {
+    log_error("Failed to re-enable UDC");
+    return false;
+  }
+
+  log_info("All ISOs/IMGs unmounted successfully!");
+  return success;
+}
+
 bool set_udc(const std::string& udc, const std::string& gadget) {
   fs::path udcFile = fs::path(gadget) / "UDC";
   return sysfs_write(udcFile.string(), udc);

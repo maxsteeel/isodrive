@@ -2,6 +2,7 @@
 #define CONFIGFSISOMANAGER_H
 
 #include <string>
+#include <vector>
 #include "util.h"
 
 /**
@@ -58,14 +59,14 @@ std::string get_gadget_root();
 std::string get_config_root();
 
 /**
- * @brief Mount an ISO file as a USB mass storage device.
+ * @brief Mount an ISO/IMG file as a USB mass storage device.
  * 
  * Configures the USB gadget mass storage function to expose the
- * specified ISO file. Supports CD-ROM mode and Windows ISO compatibility.
+ * specified ISO/IMG file. Supports CD-ROM mode and Windows ISO compatibility.
  * 
  * If iso_path is empty, unmounts any currently mounted ISO.
  * 
- * @param iso_path Path to the ISO file to mount, or empty to unmount.
+ * @param iso_path Path to the ISO/IMG file to mount, or empty to unmount.
  * @param cdrom If true, mount as CD-ROM device.
  * @param ro If true, mount as read-only.
  * @param win_opts Windows-specific mount options.
@@ -91,5 +92,31 @@ bool set_udc(const std::string& udc, const std::string& gadget);
  * @return The UDC name, or empty string if no active gadget.
  */
 std::string get_udc();
+
+/**
+ * @brief Mount multiple ISO/IMG files as separate LUNs.
+ * 
+ * Configures the USB gadget mass storage function to expose multiple
+ * ISO/IMG files as separate LUNs (Logical Unit Numbers).
+ * 
+ * @param iso_paths Vector of paths to ISO/IMG files to mount.
+ * @param cdroms Vector of CD-ROM mode flags (one per file).
+ * @param ros Vector of read-only flags (one per file).
+ * @param win_opts Windows-specific mount options.
+ * @return true if all operations succeeded, false on error.
+ */
+bool mount_multiple_isos(const std::vector<std::string>& iso_paths, 
+                         const std::vector<bool>& cdroms, 
+                         const std::vector<bool>& ros, 
+                         const WindowsMountOptions& win_opts);
+
+/**
+ * @brief Unmount all mounted ISO/IMG files from all LUNs.
+ * 
+ * Clears all file paths from LUNs and removes the mass storage configuration.
+ * 
+ * @return true if the operation succeeded, false on error.
+ */
+bool unmount_all_isos();
 
 #endif // ifndef CONFIGFSISOMANAGER_H

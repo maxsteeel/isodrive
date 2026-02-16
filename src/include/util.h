@@ -67,14 +67,14 @@ bool isdir(const std::string& path);
 bool isfile(const std::string& path);
 
 /**
- * @brief Detect if an ISO file is a hybrid (bootable) ISO.
+ * @brief Detect if an ISO/IMG file is a hybrid (bootable) image.
  * 
  * Checks for the MBR boot signature (0x55AA) at offset 510-511.
- * Hybrid ISOs can be booted from USB as a hard drive.
- * Non-hybrid ISOs (like Windows installers) should be mounted as CD-ROM.
+ * Hybrid images can be booted from USB as a hard drive.
+ * Non-hybrid images (like Windows installers) should be mounted as CD-ROM.
  * 
- * @param path Path to the ISO file.
- * @return true if the ISO has a valid MBR boot signature (hybrid),
+ * @param path Path to the ISO/IMG file.
+ * @return true if the image has a valid MBR boot signature (hybrid),
  *         false if not present or file cannot be read.
  */
 bool is_hybrid_iso(const std::string& path);

@@ -4,12 +4,15 @@
 #include "util.h"
 #include <iostream>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 void print_help() {
   std::cout << "Usage:\n"
             << "isodrive [FILE]... [OPTION]...\n"
-            << "Mounts the given FILE as a bootable device using configfs.\n"
+            << "Mounts the given FILE(s) as bootable device(s) using configfs.\n"
+            << "Supports both ISO and IMG files, with multi-LUN support for mounting\n"
+            << "multiple files as separate drives.\n"
             << "Run without any arguments to unmount any mounted files and display "
                "this help message.\n\n"
             << "Optional arguments:\n"
@@ -21,6 +24,8 @@ void print_help() {
             << "-win10\t\t Forces Windows 10 mode.\n"
             << "-win11\t\t Forces Windows 11 mode.\n"
             << "-usb3\t\t Uses USB 3.0 (SuperSpeed) descriptors.\n\n"
+            << "Multi-LUN options:\n"
+            << "-multi\t\t Enables multi-LUN mode for mounting multiple files.\n\n"
             << "Backend options:\n"
             << "-configfs\t Forces the app to use configfs.\n"
             << "-usbgadget\t Forces the app to use sysfs.\n\n"
@@ -39,6 +44,25 @@ bool configs(const std::string& iso_target, bool cdrom, bool ro, const WindowsMo
   }
   
   return mount_iso(iso_target, cdrom, ro, win_opts);
+}
+
+bool configs_multi(const std::vector<std::string>& iso_paths,
+                   const std::vector<bool>& cdroms,
+                   const std::vector<bool>& ros,
+                   const WindowsMountOptions& win_opts) {
+  log_info("Using configfs (multi-LUN mode)!");
+
+  if (!supported())
+  {
+    log_error("usb_gadget is not supported!");
+    return false;
+  }
+
+  if (iso_paths.empty()) {
+    return unmount_all_isos();
+  }
+  
+  return mount_multiple_isos(iso_paths, cdroms, ros, win_opts);
 }
 
 bool usb(const std::string& iso_target, bool cdrom, bool ro) {
@@ -64,14 +88,19 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  std::string iso_target = "";
-  bool cdrom = false;
-  bool ro = true;
+  bool multi_mode = false;
+  std::vector<std::string> iso_targets;
+  std::vector<bool> cdroms;
+  std::vector<bool> ros;
+  std::vector<bool> force_hdds;
+  
+  bool default_cdrom = false;
+  bool default_ro = true;
+  bool default_force_hdd = false;
+  
   bool force_configfs = false;
   bool force_usbgadget = false;
-  bool force_hdd = false;
   
-  // Windows options
   bool windows_mode = false;
   bool force_win10 = false;
   bool force_win11 = false;
@@ -80,9 +109,23 @@ int main(int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "-rw") {
-      ro = false;
+      default_ro = false;
+      for (size_t j = 0; j < iso_targets.size(); j++) {
+        if (j >= ros.size()) ros.push_back(false);
+        else ros[j] = false;
+      }
     } else if (arg == "-cdrom") {
-      cdrom = true;
+      default_cdrom = true;
+      for (size_t j = 0; j < iso_targets.size(); j++) {
+        if (j >= cdroms.size()) cdroms.push_back(true);
+        else cdroms[j] = true;
+      }
+    } else if (arg == "-hdd") {
+      default_force_hdd = true;
+      for (size_t j = 0; j < iso_targets.size(); j++) {
+        if (j >= force_hdds.size()) force_hdds.push_back(true);
+        else force_hdds[j] = true;
+      }
     } else if (arg == "-windows") {
       windows_mode = true;
     } else if (arg == "-win10") {
@@ -93,8 +136,8 @@ int main(int argc, char *argv[]) {
       force_win11 = true;
     } else if (arg == "-usb3") {
       use_usb3 = true;
-    } else if (arg == "-hdd") {
-      force_hdd = true;
+    } else if (arg == "-multi" || arg == "--multi") {
+      multi_mode = true;
     } else if (arg == "-configfs") {
       force_configfs = true;
     } else if (arg == "-usbgadget") {
@@ -103,8 +146,17 @@ int main(int argc, char *argv[]) {
       log_set_level(LogLevel::DEBUG);
     } else if (arg == "-q" || arg == "-quiet") {
       log_set_level(LogLevel::ERROR);
-    } else if (iso_target.empty() && arg[0] != '-') {
-      iso_target = arg;
+    } else if (arg[0] != '-') {
+      iso_targets.push_back(arg);
+      if (default_cdrom) {
+        if (cdroms.size() < iso_targets.size()) cdroms.push_back(true);
+      }
+      if (!default_ro) {
+        if (ros.size() < iso_targets.size()) ros.push_back(false);
+      }
+      if (default_force_hdd) {
+        if (force_hdds.size() < iso_targets.size()) force_hdds.push_back(true);
+      }
     }
   }
 
@@ -112,7 +164,102 @@ int main(int argc, char *argv[]) {
     print_help();
   }
 
-  // Check for incompatible flags
+  if (force_win10 && force_win11) {
+    log_error("Incompatible arguments -win10 and -win11");
+    return 1;
+  }
+
+  if (multi_mode) {
+    if (iso_targets.empty()) {
+      log_info("No files specified, unmounting all ISOs...");
+    } else {
+      for (size_t i = 0; i < iso_targets.size(); i++) {
+        if (!isfile(iso_targets[i])) {
+          log_error("File not found: " + iso_targets[i]);
+          return 1;
+        }
+      }
+    }
+
+    WindowsMountOptions win_opts = {};
+    win_opts.enabled = false;
+    win_opts.version = WindowsVersion::NONE;
+    win_opts.use_usb3 = use_usb3;
+    win_opts.has_uefi = false;
+    win_opts.has_legacy = false;
+
+    if (!iso_targets.empty() && !force_hdds.empty() && force_hdds[0]) {
+      log_info("HDD mode forced, skipping Windows detection");
+    } else if (!iso_targets.empty()) {
+      for (size_t i = 0; i < iso_targets.size(); i++) {
+        WindowsIsoInfo iso_info = get_windows_iso_info(iso_targets[i]);
+        
+        if (iso_info.is_windows || windows_mode) {
+          if (!win_opts.enabled) {
+            win_opts.enabled = true;
+          }
+          
+          if (force_win11) {
+            win_opts.version = WindowsVersion::WIN11;
+          } else if (force_win10) {
+            win_opts.version = WindowsVersion::WIN10;
+          } else if (iso_info.is_windows) {
+            win_opts.version = iso_info.version;
+          } else {
+            win_opts.version = WindowsVersion::WIN_UNKNOWN;
+          }
+          
+          win_opts.has_uefi = win_opts.has_uefi || iso_info.has_uefi;
+          win_opts.has_legacy = win_opts.has_legacy || iso_info.has_legacy;
+          
+          if (iso_info.is_windows && !windows_mode) {
+            log_info("Windows ISO detected: " + iso_targets[i]);
+            log_info("Auto-enabling Windows mode.");
+          }
+        } else if (!force_hdds.empty() && !force_hdds[i]) {
+          if (!is_hybrid_iso(iso_targets[i])) {
+            if (i >= cdroms.size()) {
+              cdroms.push_back(true);
+            } else {
+              cdroms[i] = true;
+            }
+            log_info("Non-hybrid ISO detected: " + iso_targets[i] + ", using CD-ROM mode");
+          }
+        } else if (!is_hybrid_iso(iso_targets[i])) {
+          if (i >= cdroms.size()) {
+            cdroms.push_back(true);
+          } else {
+            cdroms[i] = true;
+          }
+          log_info("Non-hybrid ISO detected: " + iso_targets[i] + ", using CD-ROM mode");
+        }
+      }
+    }
+
+    while (cdroms.size() < iso_targets.size()) cdroms.push_back(false);
+    while (ros.size() < iso_targets.size()) ros.push_back(true);
+    while (force_hdds.size() < iso_targets.size()) force_hdds.push_back(false);
+
+    bool success = false;
+
+    if (force_usbgadget) {
+      log_error("Multi-LUN mode requires configfs backend");
+      return 1;
+    } else if (force_configfs || supported()) {
+      success = configs_multi(iso_targets, cdroms, ros, win_opts);
+    } else {
+      log_error("Device does not support isodrive");
+      return 1;
+    }
+
+    return success ? 0 : 1;
+  }
+
+  std::string iso_target = iso_targets.empty() ? "" : iso_targets[0];
+  bool cdrom = default_cdrom;
+  bool ro = default_ro;
+  bool force_hdd = default_force_hdd;
+
   if (cdrom && !ro && !windows_mode) {
     log_error("Incompatible arguments -cdrom and -rw");
     return 1;
@@ -120,11 +267,6 @@ int main(int argc, char *argv[]) {
 
   if (cdrom && force_hdd) {
     log_error("Incompatible arguments -cdrom and -hdd");
-    return 1;
-  }
-
-  if (force_win10 && force_win11) {
-    log_error("Incompatible arguments -win10 and -win11");
     return 1;
   }
 
