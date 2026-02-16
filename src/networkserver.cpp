@@ -17,7 +17,6 @@ static std::atomic<bool> g_network_share_running(false);
 static std::atomic<NetworkProtocol> g_current_protocol(NetworkProtocol::NONE);
 static NetworkShareOptions g_current_options;
 static std::mutex g_network_mutex;
-static pid_t g_server_pid = -1;
 
 static bool execute_command(const std::string& cmd) {
   log_debug("Executing: " + cmd);
@@ -28,11 +27,12 @@ static bool execute_command(const std::string& cmd) {
 static std::string execute_command_output(const std::string& cmd) {
   std::array<char, 128> buffer;
   std::string result;
-  std::unique_ptr<FILE, decltype(&pclose)> pipe(popen((cmd + " 2>/dev/null").c_str()), pclose);
+  FILE* pipe = popen((cmd + " 2>/dev/null").c_str(), "r");
   if (!pipe) return "";
-  while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+  while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
     result += buffer.data();
   }
+  pclose(pipe);
   // Remove trailing newline
   if (!result.empty() && result.back() == '\n') {
     result.pop_back();
