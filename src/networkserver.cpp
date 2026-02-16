@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <signal.h>
 
 namespace fs = std::filesystem;
 
@@ -75,9 +76,15 @@ bool has_iscsi_target() {
          !execute_command_output("which targetcli").empty();
 }
 
+bool has_dnsmasq() {
+  return fs::exists("/usr/sbin/dnsmasq") || 
+         fs::exists("/sbin/dnsmasq") ||
+         !execute_command_output("which dnsmasq").empty();
+}
+
 std::string get_local_ip_address() {
   // Try to get IP from common interfaces
-  std::vector<std::string> interfaces = {"wlan0", "eth0", "usb0", "rndis0", "ap0", "en0"};
+  std::vector<std::string> interfaces = {"wlan0", "eth0", "usb0", "rndis0", "ap0", "en0", "wlan1"};
   
   for (const auto& iface : interfaces) {
     std::string cmd = "ip -4 addr show " + iface + " 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'";
@@ -112,6 +119,7 @@ std::string network_protocol_to_string(NetworkProtocol protocol) {
     case NetworkProtocol::SMB: return "SMB";
     case NetworkProtocol::HTTP: return "HTTP (iPXE)";
     case NetworkProtocol::ISCSI: return "iSCSI";
+    case NetworkProtocol::NETBOOT: return "NetBoot (DHCP+TFTP+HTTP)";
     default: return "None";
   }
 }
@@ -225,52 +233,117 @@ static bool stop_smb_server() {
   return true;
 }
 
-// HTTP Server Implementation with iPXE support
-static bool handle_http_request(int client_fd, const std::string& path) {
-  std::string filename = fs::path(path).filename();
-  std::string file_path = "/data/local/tmp/isodrive_http/content/" + filename;
-  
-  if (!fs::exists(file_path)) {
-    std::string not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-    send(client_fd, not_found.c_str(), not_found.length(), 0);
-    return false;
-  }
-  
-  // Get file size
-  uint64_t file_size = fs::file_size(file_path);
-  
-  // Send HTTP headers
-  std::ostringstream response;
-  response << "HTTP/1.1 200 OK\r\n";
-  response << "Content-Type: application/octet-stream\r\n";
-  response << "Content-Length: " << file_size << "\r\n";
-  response << "Content-Disposition: attachment; filename=\"" << filename << "\"\r\n";
-  response << "Accept-Ranges: bytes\r\n";
-  response << "Access-Control-Allow-Origin: *\r\n";
-  response << "\r\n";
-  
-  std::string headers = response.str();
-  send(client_fd, headers.c_str(), headers.length(), 0);
-  
-  // Send file content in chunks
-  std::ifstream file(file_path, std::ios::binary);
-  if (!file) {
-    return false;
-  }
-  
-  char buffer[8192];
-  while (file.good() && !file.eof()) {
-    file.read(buffer, sizeof(buffer));
-    ssize_t bytes_read = file.gcount();
-    if (bytes_read > 0) {
-      send(client_fd, buffer, bytes_read, 0);
+// HTTP Server Implementation with iPXE support - FIXED VERSION
+static bool handle_http_request(int client_fd, const std::string& path, int http_port) {
+  try {
+    // Extract filename from path
+    std::string filename;
+    if (path == "/" || path == "/boot.ipxe") {
+      // Handle iPXE script request
+      std::ostringstream ipxe_script;
+      ipxe_script << "#!ipxe\n";
+      ipxe_script << "echo ========================================\n";
+      ipxe_script << "echo    ISOdrive Network Boot\n";
+      ipxe_script << "echo ========================================\n";
+      ipxe_script << "echo\n";
+      
+      std::string ip = get_local_ip_address();
+      
+      // Menu for boot options
+      ipxe_script << "menu ISOdrive Boot Menu\n";
+      ipxe_script << "item local Boot from local disk\n";
+      
+      int idx = 1;
+      for (const auto& file : g_current_options.paths) {
+        std::string fname = fs::path(file).filename();
+        ipxe_script << "item boot_" << idx << " " << fname << "\n";
+        idx++;
+      }
+      ipxe_script << "choose --timeout 5000 --default local selected || goto local\n";
+      ipxe_script << "goto ${selected}\n";
+      
+      idx = 1;
+      for (const auto& file : g_current_options.paths) {
+        std::string fname = fs::path(file).filename();
+        ipxe_script << ":boot_" << idx << "\n";
+        ipxe_script << "echo Booting " << fname << "...\n";
+        ipxe_script << "kernel http://" << ip << ":" << http_port << "/" << fname << "\n";
+        ipxe_script << "boot\n";
+        idx++;
+      }
+      
+      ipxe_script << ":local\n";
+      ipxe_script << "exit\n";
+      
+      std::string script = ipxe_script.str();
+      std::string response = "HTTP/1.1 200 OK\r\n";
+      response += "Content-Type: text/plain\r\n";
+      response += "Content-Length: " + std::to_string(script.length()) + "\r\n";
+      response += "X-Theme: ipxe\r\n";
+      response += "\r\n";
+      response += script;
+      
+      send(client_fd, response.c_str(), response.length(), 0);
+      return true;
     }
+    
+    // Extract filename from path (remove leading /)
+    filename = path;
+    if (filename.length() > 0 && filename[0] == '/') {
+      filename = filename.substr(1);
+    }
+    
+    std::string file_path = "/data/local/tmp/isodrive_http/content/" + filename;
+    
+    if (!fs::exists(file_path)) {
+      std::string not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+      send(client_fd, not_found.c_str(), not_found.length(), 0);
+      return false;
+    }
+    
+    // Get file size
+    uint64_t file_size = fs::file_size(file_path);
+    
+    // Send HTTP headers
+    std::ostringstream response;
+    response << "HTTP/1.1 200 OK\r\n";
+    response << "Content-Type: application/octet-stream\r\n";
+    response << "Content-Length: " << file_size << "\r\n";
+    response << "Content-Disposition: attachment; filename=\"" << filename << "\"\r\n";
+    response << "Accept-Ranges: bytes\r\n";
+    response << "Access-Control-Allow-Origin: *\r\n";
+    response << "\r\n";
+    
+    std::string headers = response.str();
+    send(client_fd, headers.c_str(), headers.length(), 0);
+    
+    // Send file content in chunks
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file) {
+      return false;
+    }
+    
+    char buffer[8192];
+    while (file.good() && g_network_share_running.load()) {
+      file.read(buffer, sizeof(buffer));
+      ssize_t bytes_read = file.gcount();
+      if (bytes_read > 0) {
+        ssize_t sent = send(client_fd, buffer, bytes_read, 0);
+        if (sent <= 0) break;
+      }
+    }
+    
+    return true;
+  } catch (const std::exception& e) {
+    log_error("HTTP request error: " + std::string(e.what()));
+    return false;
   }
-  
-  return true;
 }
 
 static void http_server_worker(int port) {
+  // Set up signal handling for this thread
+  signal(SIGPIPE, SIG_IGN);
+  
   g_http_server_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (g_http_server_socket < 0) {
     log_error("Failed to create HTTP server socket");
@@ -306,8 +379,24 @@ static void http_server_worker(int port) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     
+    // Use timeout to allow checking g_network_share_running
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(g_http_server_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
     int client_fd = accept(g_http_server_socket, (struct sockaddr*)&client_addr, &client_len);
+    
+    // Reset timeout
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    setsockopt(g_http_server_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
     if (client_fd < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // Timeout - continue loop to check running flag
+        continue;
+      }
       if (g_network_share_running.load()) {
         log_warn("Failed to accept HTTP connection");
       }
@@ -315,46 +404,22 @@ static void http_server_worker(int port) {
     }
     
     // Simple HTTP request parsing
-    char buffer[1024];
+    char buffer[2048];
     ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    
     if (bytes_read > 0) {
       buffer[bytes_read] = '\0';
       
       // Parse request line
       std::string request(buffer);
       std::istringstream iss(request);
-      std::string method, path, http_version;
-      iss >> method >> path >> http_version;
+      std::string method, req_path, http_version;
+      iss >> method >> req_path >> http_version;
       
-      log_debug("HTTP request: " + method + " " + path);
+      log_debug("HTTP request: " + method + " " + req_path);
       
-      // Simple iPXE support - redirect to file download
-      if (path == "/" || path == "/boot.ipxe") {
-        // Generate iPXE script
-        std::ostringstream ipxe_script;
-        ipxe_script << "#!ipxe\n";
-        ipxe_script << "echo ISOdrive iPXE Boot Menu\n";
-        ipxe_script << "echo Loading boot files...\n";
-        
-        std::string ip = get_local_ip_address();
-        for (const auto& file : g_current_options.paths) {
-          std::string filename = fs::path(file).filename();
-          ipxe_script << "kernel http://" << ip << ":" << port << "/" << filename << "\n";
-          ipxe_script << "boot\n";
-        }
-        
-        std::string response = "HTTP/1.1 200 OK\r\n";
-        response += "Content-Type: text/plain\r\n";
-        response += "Content-Length: " + std::to_string(ipxe_script.str().length()) + "\r\n";
-        response += "X-Theme: ipxe\r\n";
-        response += "\r\n";
-        response += ipxe_script.str();
-        
-        send(client_fd, response.c_str(), response.length(), 0);
-      } else {
-        // Serve file
-        handle_http_request(client_fd, path);
-      }
+      // Handle request
+      handle_http_request(client_fd, req_path, port);
     }
     
     close(client_fd);
@@ -364,6 +429,8 @@ static void http_server_worker(int port) {
     close(g_http_server_socket);
     g_http_server_socket = -1;
   }
+  
+  log_info("HTTP server thread exiting");
 }
 
 static bool start_http_server(const NetworkShareOptions& options) {
@@ -392,7 +459,7 @@ static bool start_http_server(const NetworkShareOptions& options) {
     }
   }
   
-  // Start HTTP server in background thread
+  // Start HTTP server in background thread - DETACH to prevent crash on main exit
   g_http_server_thread = std::thread(http_server_worker, port);
   
   // Wait a bit for server to start
@@ -421,15 +488,127 @@ static bool stop_http_server() {
     g_http_server_socket = -1;
   }
   
-  // Wait for thread to finish
+  // Give thread time to exit
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  
+  // Detach to avoid hanging
   if (g_http_server_thread.joinable()) {
-    g_http_server_thread.join();
+    g_http_server_thread.detach();
   }
   
   // Clean up
   std::string http_content_dir = "/data/local/tmp/isodrive_http";
   if (fs::exists(http_content_dir)) {
     fs::remove_all(http_content_dir);
+  }
+  
+  return true;
+}
+
+// NetBoot Server (DHCP + TFTP + HTTP) using dnsmasq
+static bool start_netboot_server(const NetworkShareOptions& options) {
+  log_info("Starting NetBoot server (DHCP + TFTP + HTTP)...");
+  
+  if (!has_dnsmasq()) {
+    log_error("dnsmasq not available on this system");
+    return false;
+  }
+  
+  std::string ip = get_local_ip_address();
+  if (ip.empty()) {
+    log_error("Cannot determine IP address for NetBoot");
+    return false;
+  }
+  
+  // Start HTTP server first (required for iPXE booting)
+  if (!start_http_server(options)) {
+    log_error("Failed to start HTTP server for NetBoot");
+    return false;
+  }
+  
+  // Create dnsmasq config
+  std::string dnsmasq_conf_dir = "/data/local/tmp/isodrive_netboot";
+  fs::create_directories(dnsmasq_conf_dir);
+  fs::create_directories(dnsmasq_conf_dir + "/tftp");
+  
+  std::string dnsmasq_conf = dnsmasq_conf_dir + "/dnsmasq.conf";
+  std::ofstream config(dnsmasq_conf);
+  if (!config) {
+    log_error("Failed to create dnsmasq config");
+    stop_http_server();
+    return false;
+  }
+  
+  // Extract base IP (e.g., 192.168.9 from 192.168.9.116)
+  std::string base_ip = ip.substr(0, ip.rfind('.'));
+  
+  config << "interface=wlan0\n";
+  config << "bind-interfaces\n";
+  config << "dhcp-range=" << base_ip << ".100," << base_ip << ".250,255.255.255.0,12h\n";
+  config << "dhcp-option=3," << ip << "\n";  // Router
+  config << "dhcp-option=6," << ip << "\n";   // DNS
+  config << "dhcp-host=00:00:00:00:00:00,set:ipxe\n";  // For PXE clients
+  config << "dhcp-match=set:ipxe,option:client-arch,0\n";
+  config << "dhcp-boot=tag:ipxe,http://" << ip << ":8080/boot.ipxe\n";
+  config << "enable-tftp\n";
+  config << "tftp-root=" << dnsmasq_conf_dir << "/tftp\n";
+  config << "log-dhcp\n";
+  config << "log-queries\n";
+  config << "quiet-dhcp\n";
+  config << "quiet-dhcp6\n";
+  config << "quiet-ra\n";
+  config.close();
+  
+  // Create a simple iPXE boot script in TFTP root
+  std::ofstream tftp_script(dnsmasq_conf_dir + "/tftp/boot.ipxe");
+  if (tftp_script) {
+    tftp_script << "#!ipxe\n";
+    tftp_script << "echo ========================================\n";
+    tftp_script << "echo    ISOdrive NetBoot\n";
+    tftp_script << "echo ========================================\n";
+    tftp_script << "echo\n";
+    tftp_script << "echo Fetching boot menu from HTTP...\n";
+    tftp_script << "chain http://" << ip << ":8080/boot.ipxe\n";
+    tftp_script.close();
+  }
+  
+  // Stop any existing dnsmasq
+  execute_command("killall dnsmasq 2>/dev/null");
+  sleep(1);
+  
+  // Start dnsmasq
+  std::string cmd = "dnsmasq -C " + dnsmasq_conf + " --no-daemon --log-queries";
+  if (!execute_command(cmd)) {
+    log_error("Failed to start dnsmasq");
+    // Try without --log-queries
+    cmd = "dnsmasq -C " + dnsmasq_conf;
+    if (!execute_command(cmd)) {
+      log_error("Failed to start dnsmasq (second attempt)");
+      stop_http_server();
+      return false;
+    }
+  }
+  
+  log_info("NetBoot server started successfully!");
+  log_info("Clients can now boot directly from network!");
+  log_info("Connect to WiFi AP and boot from network (PXE)");
+  
+  return true;
+}
+
+static bool stop_netboot_server() {
+  log_info("Stopping NetBoot server...");
+  
+  // Stop dnsmasq
+  execute_command("killall dnsmasq 2>/dev/null");
+  
+  // Stop HTTP server
+  stop_http_server();
+  
+  // Clean up
+  std::string netboot_conf_dir = "/data/local/tmp/isodrive_netboot";
+  if (fs::exists(netboot_conf_dir)) {
+    fs::remove_all(netboot_conf_dir);
   }
   
   return true;
@@ -577,6 +756,10 @@ bool start_network_share(const NetworkShareOptions& options) {
       success = start_iscsi_server(options);
       break;
       
+    case NetworkProtocol::NETBOOT:
+      success = start_netboot_server(options);
+      break;
+      
     default:
       log_error("Invalid or no network protocol specified");
       g_network_share_running.store(false);
@@ -613,6 +796,9 @@ bool stop_network_share() {
       break;
     case NetworkProtocol::ISCSI:
       success = stop_iscsi_server();
+      break;
+    case NetworkProtocol::NETBOOT:
+      success = stop_netboot_server();
       break;
     default:
       success = false;
@@ -668,6 +854,22 @@ std::string get_network_share_status() {
         status << "\n";
         status << "iPXE Boot Commands:\n";
         status << "  chainloader http://" << ip << ":" << port << "/boot.ipxe\n";
+        break;
+      }
+        
+      case NetworkProtocol::NETBOOT: {
+        status << "DHCP Range: " << ip.substr(0, ip.rfind('.')) << ".100-250\n";
+        status << "TFTP Server: " << ip << "\n";
+        status << "HTTP Port: 8080\n";
+        status << "\n";
+        status << "=== NETBOOT INSTRUCTIONS ===\n";
+        status << "1. Create a WiFi hotspot on this device\n";
+        status << "2. Connect PC to the WiFi hotspot\n";
+        status << "3. Boot PC from network (PXE/NET) in BIOS/UEFI\n";
+        status << "4. iPXE will automatically fetch boot menu\n";
+        status << "\n";
+        status << "Manual iPXE boot:\n";
+        status << "  iPXE> chainloader http://" << ip << ":8080/boot.ipxe\n";
         break;
       }
         

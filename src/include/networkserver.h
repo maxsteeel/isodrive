@@ -9,7 +9,7 @@
  * @brief Network sharing server for ISO/IMG files.
  * 
  * Provides support for sharing ISO/IMG files over the network using
- * multiple protocols: SMB, HTTP (iPXE), and iSCSI.
+ * multiple protocols: SMB, HTTP (iPXE), iSCSI, and NetBoot (DHCP+TFTP+HTTP).
  */
 
 /**
@@ -20,7 +20,8 @@ enum class NetworkProtocol {
     NONE = 0,   ///< No protocol selected
     SMB,        ///< SMB/CIFS (Windows file sharing) - NOT bootable
     HTTP,       ///< HTTP Server (iPXE) - BOOTABLE
-    ISCSI       ///< iSCSI (Network Block Device) - BOOTABLE
+    ISCSI,      ///< iSCSI (Network Block Device) - BOOTABLE
+    NETBOOT     ///< NetBoot (DHCP+TFTP+HTTP) - BOOTABLE - Full network boot
 };
 
 /**
@@ -58,6 +59,13 @@ bool has_http_server();
  * @return true if target daemon is available, false otherwise.
  */
 bool has_iscsi_target();
+
+/**
+ * @brief Check if dnsmasq is available on the system.
+ * 
+ * @return true if dnsmasq is available, false otherwise.
+ */
+bool has_dnsmasq();
 
 /**
  * @brief Start network sharing with the specified options.
@@ -107,9 +115,8 @@ std::string get_local_ip_address();
  * @brief Convert NetworkProtocol enum to human-readable string.
  * 
  * @param protocol The NetworkProtocol value.
- * @return String representation (e.g., "SMB", "HTTP", "iSCSI").
+ * @return String representation (e.g., "SMB", "HTTP", "iSCSI", "NetBoot").
  */
 std::string network_protocol_to_string(NetworkProtocol protocol);
 
 #endif // ifndef NETWORKSERVER_H
-
