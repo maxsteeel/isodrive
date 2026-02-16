@@ -145,6 +145,31 @@ bool parse_size_string(const std::string& size_str, uint64_t* out_size);
 bool create_img_file(const std::string& path, uint64_t size, bool dynamic, bool ro);
 
 /**
+ * @brief Check if mkfs.fat is available on the system.
+ * 
+ * @return true if mkfs.fat is available, false otherwise.
+ */
+bool has_mkfs_fat();
+
+/**
+ * @brief Check if mkfs.exfat is available on the system.
+ * 
+ * @return true if mkfs.exfat is available, false otherwise.
+ */
+bool has_mkfs_exfat();
+
+/**
+ * @brief Format an IMG file with a filesystem.
+ * 
+ * Formats the specified IMG file with FAT32 or exFAT.
+ * 
+ * @param path Path to the IMG file to format.
+ * @param filesystem Filesystem type: "fat32", "exfat", or "auto" (prefers exFAT).
+ * @return true if formatting succeeded, false on error.
+ */
+bool format_img_file(const std::string& path, const std::string& filesystem);
+
+/**
  * @brief Read a value from a sysfs/configfs file.
  * 
  * Reads a single whitespace-delimited token from the specified file.

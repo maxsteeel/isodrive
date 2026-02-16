@@ -438,3 +438,69 @@ bool create_img_file(const std::string& path, uint64_t size, bool dynamic, bool 
 
   return true;
 }
+
+static bool execute_command_test(const std::string& cmd) {
+  return system((cmd + " > /dev/null 2>&1").c_str()) == 0;
+}
+
+bool has_mkfs_fat() {
+  return fs::exists("/usr/sbin/mkfs.fat") || fs::exists("/sbin/mkfs.fat") || 
+         fs::exists("/usr/bin/mkfs.fat") || execute_command_test("which mkfs.fat");
+}
+
+bool has_mkfs_exfat() {
+  return fs::exists("/usr/sbin/mkfs.exfat") || fs::exists("/sbin/mkfs.exfat") || 
+         fs::exists("/usr/bin/mkfs.exfat") || execute_command_test("which mkfs.exfat");
+}
+
+bool format_img_file(const std::string& path, const std::string& filesystem) {
+  if (!fs::exists(path)) {
+    log_error("File not found: " + path);
+    return false;
+  }
+
+  std::string fs_type = filesystem;
+  std::transform(fs_type.begin(), fs_type.end(), fs_type.begin(), ::tolower);
+
+  if (fs_type == "auto") {
+    if (has_mkfs_exfat()) {
+      fs_type = "exfat";
+    } else if (has_mkfs_fat()) {
+      fs_type = "fat32";
+    } else {
+      log_error("No formatting tools available (mkfs.fat or mkfs.exfat)");
+      return false;
+    }
+  }
+
+  std::string mkfs_cmd;
+
+  if (fs_type == "fat32" || fs_type == "vfat") {
+    if (!has_mkfs_fat()) {
+      log_error("mkfs.fat not available");
+      return false;
+    }
+    mkfs_cmd = "mkfs.fat -F 32 " + path;
+    log_info("Formatting with FAT32...");
+  } else if (fs_type == "exfat") {
+    if (!has_mkfs_exfat()) {
+      log_error("mkfs.exfat not available");
+      return false;
+    }
+    mkfs_cmd = "mkfs.exfat " + path;
+    log_info("Formatting with exFAT...");
+  } else {
+    log_error("Unsupported filesystem: " + filesystem);
+    log_info("Supported: fat32, exfat, auto");
+    return false;
+  }
+
+  int result = system(mkfs_cmd.c_str());
+  if (result != 0) {
+    log_error("Formatting failed with code: " + std::to_string(result));
+    return false;
+  }
+
+  log_info("Successfully formatted: " + path);
+  return true;
+}

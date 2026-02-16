@@ -34,7 +34,10 @@ void print_help() {
             << "\t\t Size formats: 2GB, 500MB, 1TB, 1024KB, etc.\n"
             << "\t\t Options:\n"
             << "\t\t   -dynamic\t Creates a sparse file (grows on demand).\n"
-            << "\t\t   -rw\t\t Sets the file as read-write (default: read-only).\n\n"
+            << "\t\t   -rw\t\t Sets the file as read-write (default: read-only).\n"
+            << "\t\t   -format\t Formats the IMG after creation (auto-detect).\n"
+            << "\t\t   -fat32\t Formats as FAT32 (requires mkfs.fat).\n"
+            << "\t\t   -exfat\t Formats as exFAT (requires mkfs.exfat).\n\n"
             << "Backend options:\n"
             << "-configfs\t Forces the app to use configfs.\n"
             << "-usbgadget\t Forces the app to use sysfs.\n\n"
@@ -91,7 +94,8 @@ bool usb(const std::string& iso_target, bool cdrom, bool ro) {
     return usb_mount_iso(iso_target);
 }
 
-bool handle_create_mode(const std::string& img_path, const std::string& size_str, bool dynamic, bool rw) {
+bool handle_create_mode(const std::string& img_path, const std::string& size_str, 
+                        bool dynamic, bool rw, const std::string& format_type) {
   uint64_t size = 0;
   
   if (!parse_size_string(size_str, &size)) {
@@ -100,7 +104,19 @@ bool handle_create_mode(const std::string& img_path, const std::string& size_str
     return false;
   }
   
-  return create_img_file(img_path, size, dynamic, !rw);
+  bool success = create_img_file(img_path, size, dynamic, !rw);
+  if (!success) {
+    return false;
+  }
+  
+  if (!format_type.empty()) {
+    success = format_img_file(img_path, format_type);
+    if (!success) {
+      return false;
+    }
+  }
+  
+  return true;
 }
 
 int main(int argc, char *argv[]) {
@@ -115,6 +131,7 @@ int main(int argc, char *argv[]) {
   std::string create_size;
   bool create_dynamic = false;
   bool create_rw = false;
+  std::string create_format;
   
   std::vector<std::string> iso_targets;
   std::vector<bool> cdroms;
@@ -173,6 +190,12 @@ int main(int argc, char *argv[]) {
       create_mode = true;
     } else if (arg == "-dynamic") {
       create_dynamic = true;
+    } else if (arg == "-format") {
+      create_format = "auto";
+    } else if (arg == "-fat32") {
+      create_format = "fat32";
+    } else if (arg == "-exfat") {
+      create_format = "exfat";
     } else if (arg == "-configfs") {
       force_configfs = true;
     } else if (arg == "-usbgadget") {
@@ -217,7 +240,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     
-    return handle_create_mode(create_path, create_size, create_dynamic, create_rw) ? 0 : 1;
+    return handle_create_mode(create_path, create_size, create_dynamic, create_rw, create_format) ? 0 : 1;
   }
 
   if (force_win10 && force_win11) {
@@ -331,7 +354,6 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Build Windows mount options
   WindowsMountOptions win_opts = {};
   win_opts.enabled = false;
   win_opts.version = WindowsVersion::NONE;
