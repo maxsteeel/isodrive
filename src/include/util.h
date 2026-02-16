@@ -120,6 +120,31 @@ WindowsVersion get_windows_version(const std::string& path);
 std::string windows_version_to_string(WindowsVersion version);
 
 /**
+ * @brief Parse a size string to bytes.
+ * 
+ * Supports formats like: 2GB, 500MB, 1TB, 1024KB, etc.
+ * 
+ * @param size_str The size string to parse.
+ * @param out_size Pointer to store the result in bytes.
+ * @return true if parsing succeeded, false otherwise.
+ */
+bool parse_size_string(const std::string& size_str, uint64_t* out_size);
+
+/**
+ * @brief Create an IMG file with specified size.
+ * 
+ * Creates a new IMG file of the given size. If dynamic is true,
+ * creates a sparse file that grows on demand.
+ * 
+ * @param path Path where the IMG file will be created.
+ * @param size Size in bytes.
+ * @param dynamic If true, creates a sparse file.
+ * @param ro If true, sets the file as read-only.
+ * @return true if creation succeeded, false on error.
+ */
+bool create_img_file(const std::string& path, uint64_t size, bool dynamic, bool ro);
+
+/**
  * @brief Read a value from a sysfs/configfs file.
  * 
  * Reads a single whitespace-delimited token from the specified file.

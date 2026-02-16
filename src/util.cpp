@@ -9,6 +9,8 @@
 #include <iostream>
 #include <mntent.h>
 #include <string>
+#include <cmath>
+#include <sstream>
 
 namespace fs = std::filesystem;
 
@@ -328,4 +330,111 @@ std::string sysfs_read(const std::string& path) {
   sysfsFile >> value;
   log_debug("Read: " + value + " <- " + path);
   return value;
+}
+
+bool parse_size_string(const std::string& size_str, uint64_t* out_size) {
+  if (size_str.empty() || out_size == nullptr) {
+    return false;
+  }
+
+  std::string number_part;
+  std::string suffix;
+
+  for (size_t i = 0; i < size_str.size(); i++) {
+    char c = size_str[i];
+    if (std::isdigit(c) || c == '.') {
+      number_part += c;
+    } else {
+      suffix += c;
+    }
+  }
+
+  if (number_part.empty()) {
+    return false;
+  }
+
+  double value;
+  std::istringstream iss(number_part);
+  iss >> value;
+
+  if (suffix.empty()) {
+    *out_size = static_cast<uint64_t>(value);
+    return true;
+  }
+
+  std::string upper_suffix = suffix;
+  std::transform(upper_suffix.begin(), upper_suffix.end(), upper_suffix.begin(), ::toupper);
+
+  uint64_t multiplier = 1;
+
+  if (upper_suffix == "B") {
+    multiplier = 1;
+  } else if (upper_suffix == "KB" || upper_suffix == "K") {
+    multiplier = 1024;
+  } else if (upper_suffix == "MB" || upper_suffix == "M") {
+    multiplier = 1024 * 1024;
+  } else if (upper_suffix == "GB" || upper_suffix == "G") {
+    multiplier = 1024 * 1024 * 1024;
+  } else if (upper_suffix == "TB" || upper_suffix == "T") {
+    multiplier = 1024ULL * 1024 * 1024 * 1024;
+  } else {
+    return false;
+  }
+
+  *out_size = static_cast<uint64_t>(value * multiplier);
+  return true;
+}
+
+bool create_img_file(const std::string& path, uint64_t size, bool dynamic, bool ro) {
+  if (path.empty()) {
+    log_error("Empty path provided for IMG creation");
+    return false;
+  }
+
+  if (fs::exists(path)) {
+    log_error("File already exists: " + path);
+    return false;
+  }
+
+  std::string parent_dir = fs::path(path).parent_path().string();
+  if (!parent_dir.empty() && !fs::exists(parent_dir)) {
+    std::error_code ec;
+    fs::create_directories(parent_dir, ec);
+    if (ec) {
+      log_error("Failed to create directory: " + parent_dir + " - " + ec.message());
+      return false;
+    }
+  }
+
+  if (dynamic) {
+    std::ofstream file(path, std::ios::binary);
+    if (!file) {
+      log_error("Failed to create sparse file: " + path);
+      return false;
+    }
+    file.seekp(static_cast<std::streamoff>(size - 1));
+    file.put(0);
+    file.close();
+    log_info("Created sparse (dynamic) IMG: " + path + " (" + std::to_string(size) + " bytes)");
+  } else {
+    std::ofstream file(path, std::ios::binary);
+    if (!file) {
+      log_error("Failed to create file: " + path);
+      return false;
+    }
+    file.seekp(static_cast<std::streamoff>(size - 1));
+    file.put(0);
+    file.close();
+    log_info("Created IMG: " + path + " (" + std::to_string(size) + " bytes)");
+  }
+
+  if (ro) {
+    std::error_code ec;
+    fs::permissions(path, fs::perms::owner_read | fs::perms::group_read | fs::perms::others_read, ec);
+    if (ec) {
+      log_warn("Failed to set read-only permissions: " + ec.message());
+    }
+  }
+
+  return true;
 }

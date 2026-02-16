@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <cstdint>
 
 void print_help() {
   std::cout << "Usage:\n"
@@ -26,6 +27,14 @@ void print_help() {
             << "-usb3\t\t Uses USB 3.0 (SuperSpeed) descriptors.\n\n"
             << "Multi-LUN options:\n"
             << "-multi\t\t Enables multi-LUN mode for mounting multiple files.\n\n"
+            << "Image creation options:\n"
+            << "-create\t\t Creates an IMG file with specified size.\n"
+            << "\t\t Usage: -create [path] [size] [options]\n"
+            << "\t\t Example: -create example.img 2GB -dynamic -rw\n"
+            << "\t\t Size formats: 2GB, 500MB, 1TB, 1024KB, etc.\n"
+            << "\t\t Options:\n"
+            << "\t\t   -dynamic\t Creates a sparse file (grows on demand).\n"
+            << "\t\t   -rw\t\t Sets the file as read-write (default: read-only).\n\n"
             << "Backend options:\n"
             << "-configfs\t Forces the app to use configfs.\n"
             << "-usbgadget\t Forces the app to use sysfs.\n\n"
@@ -82,6 +91,18 @@ bool usb(const std::string& iso_target, bool cdrom, bool ro) {
     return usb_mount_iso(iso_target);
 }
 
+bool handle_create_mode(const std::string& img_path, const std::string& size_str, bool dynamic, bool rw) {
+  uint64_t size = 0;
+  
+  if (!parse_size_string(size_str, &size)) {
+    log_error("Invalid size format: " + size_str);
+    log_info("Valid formats: 2GB, 500MB, 1TB, 1024KB, etc.");
+    return false;
+  }
+  
+  return create_img_file(img_path, size, dynamic, !rw);
+}
+
 int main(int argc, char *argv[]) {
   if (getuid() != 0) {
     std::cerr << "Permission denied" << std::endl;
@@ -89,6 +110,12 @@ int main(int argc, char *argv[]) {
   }
 
   bool multi_mode = false;
+  bool create_mode = false;
+  std::string create_path;
+  std::string create_size;
+  bool create_dynamic = false;
+  bool create_rw = false;
+  
   std::vector<std::string> iso_targets;
   std::vector<bool> cdroms;
   std::vector<bool> ros;
@@ -109,10 +136,14 @@ int main(int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "-rw") {
-      default_ro = false;
-      for (size_t j = 0; j < iso_targets.size(); j++) {
-        if (j >= ros.size()) ros.push_back(false);
-        else ros[j] = false;
+      if (create_mode) {
+        create_rw = true;
+      } else {
+        default_ro = false;
+        for (size_t j = 0; j < iso_targets.size(); j++) {
+          if (j >= ros.size()) ros.push_back(false);
+          else ros[j] = false;
+        }
       }
     } else if (arg == "-cdrom") {
       default_cdrom = true;
@@ -138,6 +169,10 @@ int main(int argc, char *argv[]) {
       use_usb3 = true;
     } else if (arg == "-multi" || arg == "--multi") {
       multi_mode = true;
+    } else if (arg == "-create") {
+      create_mode = true;
+    } else if (arg == "-dynamic") {
+      create_dynamic = true;
     } else if (arg == "-configfs") {
       force_configfs = true;
     } else if (arg == "-usbgadget") {
@@ -147,21 +182,42 @@ int main(int argc, char *argv[]) {
     } else if (arg == "-q" || arg == "-quiet") {
       log_set_level(LogLevel::ERROR);
     } else if (arg[0] != '-') {
-      iso_targets.push_back(arg);
-      if (default_cdrom) {
-        if (cdroms.size() < iso_targets.size()) cdroms.push_back(true);
-      }
-      if (!default_ro) {
-        if (ros.size() < iso_targets.size()) ros.push_back(false);
-      }
-      if (default_force_hdd) {
-        if (force_hdds.size() < iso_targets.size()) force_hdds.push_back(true);
+      if (create_mode) {
+        if (create_path.empty()) {
+          create_path = arg;
+        } else if (create_size.empty()) {
+          create_size = arg;
+        } else {
+          iso_targets.push_back(arg);
+        }
+      } else {
+        iso_targets.push_back(arg);
+        if (default_cdrom) {
+          if (cdroms.size() < iso_targets.size()) cdroms.push_back(true);
+        }
+        if (!default_ro) {
+          if (ros.size() < iso_targets.size()) ros.push_back(false);
+        }
+        if (default_force_hdd) {
+          if (force_hdds.size() < iso_targets.size()) force_hdds.push_back(true);
+        }
       }
     }
   }
 
   if (argc == 1) {
     print_help();
+  }
+
+  if (create_mode) {
+    if (create_path.empty() || create_size.empty()) {
+      log_error("Missing arguments for -create");
+      log_info("Usage: -create [path] [size] [options]");
+      log_info("Example: -create example.img 2GB -dynamic -rw");
+      return 1;
+    }
+    
+    return handle_create_mode(create_path, create_size, create_dynamic, create_rw) ? 0 : 1;
   }
 
   if (force_win10 && force_win11) {
