@@ -453,7 +453,54 @@ bool has_mkfs_exfat() {
          fs::exists("/usr/bin/mkfs.exfat") || execute_command_test("which mkfs.exfat");
 }
 
-bool format_img_file(const std::string& path, const std::string& filesystem) {
+bool has_mkfs_ntfs() {
+  return fs::exists("/usr/sbin/mkfs.ntfs") || fs::exists("/sbin/mkfs.ntfs") || 
+         fs::exists("/usr/bin/mkfs.ntfs") || execute_command_test("which mkfs.ntfs");
+}
+
+bool has_mkfs_ext4() {
+  return fs::exists("/usr/sbin/mkfs.ext4") || fs::exists("/sbin/mkfs.ext4") || 
+         fs::exists("/usr/bin/mkfs.ext4") || execute_command_test("which mkfs.ext4");
+}
+
+bool has_mkfs_btrfs() {
+  return fs::exists("/usr/sbin/mkfs.btrfs") || fs::exists("/sbin/mkfs.btrfs") || 
+         fs::exists("/usr/bin/mkfs.btrfs") || execute_command_test("which mkfs.btrfs");
+}
+
+bool check_available_space(const std::string& path, uint64_t required_bytes) {
+  std::string dir_path = path;
+  
+  if (fs::is_regular_file(path)) {
+    dir_path = fs::path(path).parent_path().string();
+  }
+  
+  if (dir_path.empty()) {
+    dir_path = ".";
+  }
+  
+  std::error_code ec;
+  auto space_info = fs::space(dir_path, ec);
+  
+  if (ec) {
+    log_warn("Could not check available space for: " + dir_path + " - " + ec.message());
+    return true;
+  }
+  
+  if (space_info.available < required_bytes) {
+    uint64_t available_mb = space_info.available / (1024 * 1024);
+    uint64_t required_mb = required_bytes / (1024 * 1024);
+    log_error("Insufficient disk space!");
+    log_error("Available: " + std::to_string(available_mb) + " MB");
+    log_error("Required: " + std::to_string(required_mb) + " MB");
+    return false;
+  }
+  
+  log_debug("Space check passed: " + std::to_string(space_info.available / (1024 * 1024)) + " MB available");
+  return true;
+}
+
+bool format_img_file(const std::string& path, const std::string& filesystem, const std::string& label) {
   if (!fs::exists(path)) {
     log_error("File not found: " + path);
     return false;
@@ -465,33 +512,75 @@ bool format_img_file(const std::string& path, const std::string& filesystem) {
   if (fs_type == "auto") {
     if (has_mkfs_exfat()) {
       fs_type = "exfat";
+    } else if (has_mkfs_ntfs()) {
+      fs_type = "ntfs";
+    } else if (has_mkfs_ext4()) {
+      fs_type = "ext4";
+    } else if (has_mkfs_btrfs()) {
+      fs_type = "btrfs";
     } else if (has_mkfs_fat()) {
       fs_type = "fat32";
     } else {
-      log_error("No formatting tools available (mkfs.fat or mkfs.exfat)");
+      log_error("No formatting tools available");
       return false;
     }
   }
 
   std::string mkfs_cmd;
+  std::string label_arg;
+
+  if (!label.empty()) {
+    if (fs_type == "fat32" || fs_type == "vfat") {
+      label_arg = " -n \"" + label + "\"";
+    } else if (fs_type == "exfat") {
+      label_arg = " -L \"" + label + "\"";
+    } else if (fs_type == "ntfs") {
+      label_arg = " -L \"" + label + "\"";
+    } else if (fs_type == "ext4") {
+      label_arg = " -L \"" + label + "\"";
+    } else if (fs_type == "btrfs") {
+      label_arg = " -L \"" + label + "\"";
+    }
+  }
 
   if (fs_type == "fat32" || fs_type == "vfat") {
     if (!has_mkfs_fat()) {
       log_error("mkfs.fat not available");
       return false;
     }
-    mkfs_cmd = "mkfs.fat -F 32 " + path;
+    mkfs_cmd = "mkfs.fat -F 32" + label_arg + " " + path;
     log_info("Formatting with FAT32...");
   } else if (fs_type == "exfat") {
     if (!has_mkfs_exfat()) {
       log_error("mkfs.exfat not available");
       return false;
     }
-    mkfs_cmd = "mkfs.exfat " + path;
+    mkfs_cmd = "mkfs.exfat" + label_arg + " " + path;
     log_info("Formatting with exFAT...");
+  } else if (fs_type == "ntfs") {
+    if (!has_mkfs_ntfs()) {
+      log_error("mkfs.ntfs not available");
+      return false;
+    }
+    mkfs_cmd = "mkfs.ntfs" + label_arg + " -f " + path;
+    log_info("Formatting with NTFS...");
+  } else if (fs_type == "ext4") {
+    if (!has_mkfs_ext4()) {
+      log_error("mkfs.ext4 not available");
+      return false;
+    }
+    mkfs_cmd = "mkfs.ext4" + label_arg + " -F " + path;
+    log_info("Formatting with ext4...");
+  } else if (fs_type == "btrfs") {
+    if (!has_mkfs_btrfs()) {
+      log_error("mkfs.btrfs not available");
+      return false;
+    }
+    mkfs_cmd = "mkfs.btrfs" + label_arg + " -f " + path;
+    log_info("Formatting with btrfs...");
   } else {
     log_error("Unsupported filesystem: " + filesystem);
-    log_info("Supported: fat32, exfat, auto");
+    log_info("Supported: fat32, exfat, ntfs, ext4, btrfs, auto");
     return false;
   }
 
@@ -499,6 +588,10 @@ bool format_img_file(const std::string& path, const std::string& filesystem) {
   if (result != 0) {
     log_error("Formatting failed with code: " + std::to_string(result));
     return false;
+  }
+
+  if (!label.empty()) {
+    log_info("Volume label: " + label);
   }
 
   log_info("Successfully formatted: " + path);

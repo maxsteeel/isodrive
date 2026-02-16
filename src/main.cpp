@@ -37,7 +37,11 @@ void print_help() {
             << "\t\t   -rw\t\t Sets the file as read-write (default: read-only).\n"
             << "\t\t   -format\t Formats the IMG after creation (auto-detect).\n"
             << "\t\t   -fat32\t Formats as FAT32 (requires mkfs.fat).\n"
-            << "\t\t   -exfat\t Formats as exFAT (requires mkfs.exfat).\n\n"
+            << "\t\t   -exfat\t Formats as exFAT (requires mkfs.exfat).\n"
+            << "\t\t   -ntfs\t Formats as NTFS (requires mkfs.ntfs).\n"
+            << "\t\t   -ext4\t Formats as ext4 (requires mkfs.ext4).\n"
+            << "\t\t   -btrfs\t Formats as btrfs (requires mkfs.btrfs).\n"
+            << "\t\t   -label \"NAME\"\t Sets the volume label.\n\n"
             << "Backend options:\n"
             << "-configfs\t Forces the app to use configfs.\n"
             << "-usbgadget\t Forces the app to use sysfs.\n\n"
@@ -95,12 +99,17 @@ bool usb(const std::string& iso_target, bool cdrom, bool ro) {
 }
 
 bool handle_create_mode(const std::string& img_path, const std::string& size_str, 
-                        bool dynamic, bool rw, const std::string& format_type) {
+                        bool dynamic, bool rw, const std::string& format_type,
+                        const std::string& label) {
   uint64_t size = 0;
   
   if (!parse_size_string(size_str, &size)) {
     log_error("Invalid size format: " + size_str);
     log_info("Valid formats: 2GB, 500MB, 1TB, 1024KB, etc.");
+    return false;
+  }
+  
+  if (!check_available_space(img_path, size)) {
     return false;
   }
   
@@ -110,7 +119,7 @@ bool handle_create_mode(const std::string& img_path, const std::string& size_str
   }
   
   if (!format_type.empty()) {
-    success = format_img_file(img_path, format_type);
+    success = format_img_file(img_path, format_type, label);
     if (!success) {
       return false;
     }
@@ -132,6 +141,7 @@ int main(int argc, char *argv[]) {
   bool create_dynamic = false;
   bool create_rw = false;
   std::string create_format;
+  std::string create_label;
   
   std::vector<std::string> iso_targets;
   std::vector<bool> cdroms;
@@ -196,6 +206,16 @@ int main(int argc, char *argv[]) {
       create_format = "fat32";
     } else if (arg == "-exfat") {
       create_format = "exfat";
+    } else if (arg == "-ntfs") {
+      create_format = "ntfs";
+    } else if (arg == "-ext4") {
+      create_format = "ext4";
+    } else if (arg == "-btrfs") {
+      create_format = "btrfs";
+    } else if (arg == "-label") {
+      if (i + 1 < argc) {
+        create_label = argv[++i];
+      }
     } else if (arg == "-configfs") {
       force_configfs = true;
     } else if (arg == "-usbgadget") {
@@ -240,7 +260,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     
-    return handle_create_mode(create_path, create_size, create_dynamic, create_rw, create_format) ? 0 : 1;
+    return handle_create_mode(create_path, create_size, create_dynamic, create_rw, create_format, create_label) ? 0 : 1;
   }
 
   if (force_win10 && force_win11) {

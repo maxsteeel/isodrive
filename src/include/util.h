@@ -159,15 +159,46 @@ bool has_mkfs_fat();
 bool has_mkfs_exfat();
 
 /**
+ * @brief Check if mkfs.ntfs is available on the system.
+ * 
+ * @return true if mkfs.ntfs is available, false otherwise.
+ */
+bool has_mkfs_ntfs();
+
+/**
+ * @brief Check if mkfs.ext4 is available on the system.
+ * 
+ * @return true if mkfs.ext4 is available, false otherwise.
+ */
+bool has_mkfs_ext4();
+
+/**
+ * @brief Check if mkfs.btrfs is available on the system.
+ * 
+ * @return true if mkfs.btrfs is available, false otherwise.
+ */
+bool has_mkfs_btrfs();
+
+/**
+ * @brief Check available disk space for creating files.
+ * 
+ * @param path Path to check (directory or file location).
+ * @param required_bytes Required space in bytes.
+ * @return true if enough space is available, false otherwise.
+ */
+bool check_available_space(const std::string& path, uint64_t required_bytes);
+
+/**
  * @brief Format an IMG file with a filesystem.
  * 
- * Formats the specified IMG file with FAT32 or exFAT.
+ * Formats the specified IMG file with the specified filesystem.
  * 
  * @param path Path to the IMG file to format.
- * @param filesystem Filesystem type: "fat32", "exfat", or "auto" (prefers exFAT).
+ * @param filesystem Filesystem type: "fat32", "exfat", "ntfs", "ext4", "btrfs", or "auto".
+ * @param label Volume label for the filesystem (optional).
  * @return true if formatting succeeded, false on error.
  */
-bool format_img_file(const std::string& path, const std::string& filesystem);
+bool format_img_file(const std::string& path, const std::string& filesystem, const std::string& label = "");
 
 /**
  * @brief Read a value from a sysfs/configfs file.
