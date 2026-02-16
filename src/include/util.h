@@ -223,4 +223,21 @@ std::string sysfs_read(const std::string& path);
  */
 bool sysfs_write(const std::string& path, const std::string& content);
 
+/**
+ * @brief Resolve a file path with CWD support.
+ * 
+ * Resolves relative paths (./, ../, relative filenames) to absolute paths
+ * using the current working directory. Also validates that the file exists.
+ * 
+ * @param path The path to resolve (can be relative or absolute).
+ * @return The resolved absolute path if file exists, empty string if not found.
+ * 
+ * @example
+ * resolve_path("test.img")        // Returns "/storage/emulated/0/test.img" if CWD is that dir
+ * resolve_path("./test.img")      // Same as above
+ * resolve_path("../test.img")     // Returns parent_dir/test.img
+ * resolve_path("/absolute/path")  // Returns the absolute path if file exists
+ */
+std::string resolve_path(const std::string& path);
+
 #endif // ifndef UTIL_H

@@ -332,6 +332,54 @@ std::string sysfs_read(const std::string& path) {
   return value;
 }
 
+std::string resolve_path(const std::string& path) {
+  if (path.empty()) {
+    log_debug("Empty path provided to resolve_path");
+    return "";
+  }
+
+  // If path is already absolute, check if it exists
+  if (path[0] == '/') {
+    if (fs::exists(path) && fs::is_regular_file(path)) {
+      log_debug("Resolved absolute path: " + path);
+      return path;
+    }
+    log_debug("Absolute path does not exist: " + path);
+    return "";
+  }
+
+  // Get current working directory
+  std::string cwd;
+  try {
+    cwd = fs::current_path().string();
+  } catch (const fs::filesystem_error& e) {
+    log_error("Failed to get current working directory: " + std::string(e.what()));
+    return "";
+  }
+
+  // Build the full path
+  fs::path full_path = fs::path(cwd) / path;
+  
+  // Resolve the path (handles .., ., etc.)
+  try {
+    full_path = fs::canonical(full_path);
+  } catch (const fs::filesystem_error& e) {
+    // canonical() fails if path doesn't exist, try absolute without canonical
+    full_path = fs::absolute(fs::path(cwd) / path);
+  }
+
+  std::string resolved = full_path.string();
+  
+  // Check if the resolved path exists and is a regular file
+  if (fs::exists(resolved) && fs::is_regular_file(resolved)) {
+    log_debug("Resolved path: " + path + " -> " + resolved);
+    return resolved;
+  }
+
+  log_debug("Resolved path does not exist: " + resolved + " (original: " + path + ")");
+  return "";
+}
+
 bool parse_size_string(const std::string& size_str, uint64_t* out_size) {
   if (size_str.empty() || out_size == nullptr) {
     return false;

@@ -260,6 +260,16 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     
+    // Resolve create_path with CWD support
+    std::string resolved_create_path = resolve_path(create_path);
+    if (!resolved_create_path.empty()) {
+      log_info("Resolved: " + create_path + " -> " + resolved_create_path);
+      create_path = resolved_create_path;
+    } else if (create_path[0] != '/') {
+      // Only warn if it's a relative path that wasn't resolved
+      log_warn("Could not resolve path, file will be created as: " + create_path);
+    }
+    
     return handle_create_mode(create_path, create_size, create_dynamic, create_rw, create_format, create_label) ? 0 : 1;
   }
 
@@ -272,11 +282,16 @@ int main(int argc, char *argv[]) {
     if (iso_targets.empty()) {
       log_info("No files specified, unmounting all ISOs...");
     } else {
+      // Resolve all paths with CWD support
       for (size_t i = 0; i < iso_targets.size(); i++) {
-        if (!isfile(iso_targets[i])) {
+        std::string resolved = resolve_path(iso_targets[i]);
+        if (resolved.empty()) {
           log_error("File not found: " + iso_targets[i]);
+          log_info("Resolved path was: " + iso_targets[i]);
           return 1;
         }
+        log_info("Resolved: " + iso_targets[i] + " -> " + resolved);
+        iso_targets[i] = resolved;
       }
     }
 
@@ -369,9 +384,16 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  if (!iso_target.empty() && !isfile(iso_target)) {
-    log_error("File not found: " + iso_target);
-    return 1;
+  if (!iso_target.empty()) {
+    // Resolve path with CWD support
+    std::string resolved = resolve_path(iso_target);
+    if (resolved.empty()) {
+      log_error("File not found: " + iso_target);
+      log_info("Resolved path was: " + iso_target);
+      return 1;
+    }
+    log_info("Resolved: " + iso_target + " -> " + resolved);
+    iso_target = resolved;
   }
 
   WindowsMountOptions win_opts = {};
