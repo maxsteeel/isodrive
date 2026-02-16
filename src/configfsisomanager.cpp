@@ -258,6 +258,7 @@ bool mount_iso(const std::string& iso_path, bool cdrom, bool ro, const WindowsMo
   // Disable stall for better Windows compatibility
   success &= sysfs_write(stallFile.string(), "0");
 
+  // Clear the file path first
   success &= sysfs_write(lunFile.string(), "");
 
   if (!iso_path.empty())
@@ -312,12 +313,31 @@ bool mount_iso(const std::string& iso_path, bool cdrom, bool ro, const WindowsMo
   }
   else
   {
+    // Unmount case: remove all LUN directories
     fs::path linkPath = fs::path(configRoot) / "mass_storage.0";
     if (fs::exists(linkPath)) {
       std::error_code ec;
       fs::remove(linkPath, ec);
       if (ec) {
         log_warn("Failed to remove symlink: " + ec.message());
+      }
+    }
+    
+    // Remove all LUN directories
+    int lunIndex = 0;
+    while (true) {
+      fs::path lunDir = massStorageRoot / ("lun." + std::to_string(lunIndex));
+      if (fs::exists(lunDir)) {
+        std::error_code ec;
+        fs::remove_all(lunDir, ec);
+        if (ec) {
+          log_warn("Failed to remove LUN directory " + lunDir.string() + ": " + ec.message());
+        } else {
+          log_debug("Removed LUN directory: " + lunDir.string());
+        }
+        ++lunIndex;
+      } else {
+        break;
       }
     }
   }
@@ -475,13 +495,23 @@ bool unmount_all_isos() {
     log_warn("Failed to disable UDC before configuration");
   }
 
-  // Clear all LUN file paths
+  // Clear all LUN file paths and remove LUN directories
   int lunIndex = 0;
   while (true) {
     fs::path lunRoot = massStorageRoot / ("lun." + std::to_string(lunIndex));
     if (fs::exists(lunRoot)) {
+      // Clear the file path first
       fs::path lunFile = lunRoot / "file";
       success &= sysfs_write(lunFile.string(), "");
+      
+      // Remove the LUN directory
+      std::error_code ec;
+      fs::remove_all(lunRoot, ec);
+      if (ec) {
+        log_warn("Failed to remove LUN directory " + lunRoot.string() + ": " + ec.message());
+      } else {
+        log_debug("Removed LUN directory: " + lunRoot.string());
+      }
       ++lunIndex;
     } else {
       // Stop if we encounter a missing LUN directory
