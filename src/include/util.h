@@ -2,6 +2,7 @@
 #define UTIL_H
 
 #include <string>
+#include <cstdint>
 
 /**
  * @file util.h

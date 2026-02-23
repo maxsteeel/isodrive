@@ -1,6 +1,7 @@
 #include "networkserver.h"
 #include "logger.h"
 #include "util.h"
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
